@@ -150,6 +150,10 @@ pub fn semanticRole(widget: Widget) WidgetRole {
         // The grouped input announces as ONE named group; the entry and
         // the accessory controls inside stay individually reachable.
         .input_group => .group,
+        // The terminal announces as an editable text region whose label
+        // carries the live viewport text (a terminal's semantic content
+        // IS its text) — the same register the platform terminals use.
+        .terminal => .textbox,
     };
 }
 
@@ -201,7 +205,12 @@ fn defaultExpandedState(widget: Widget) ?bool {
 
 fn semanticTextValue(widget: Widget) []const u8 {
     return switch (widget.kind) {
-        .input, .text_field, .search_field, .combobox, .textarea => widget.text,
+        // A terminal's screen text is its content value, distinct from
+        // its stable control name (the author label): the builder puts
+        // the live viewport text in `widget.text`, so it must surface as
+        // the text VALUE — assistive tech reads output changes and the
+        // a11y-tree fingerprint covers the screen.
+        .input, .text_field, .search_field, .combobox, .textarea, .terminal => widget.text,
         else => "",
     };
 }

@@ -2808,6 +2808,133 @@ pub fn findVideoControl(widget: canvas.Widget, verb: canvas.VideoControlVerb) ?c
     return null;
 }
 
+// -------------------------------------------------- terminal element
+
+pub const TerminalElementMsg = union(enum) { term_state: canvas.TerminalState };
+
+pub const TerminalElementModel = struct {
+    shell: u64 = 7,
+    offset: u32 = 4,
+};
+
+pub const terminal_markup_source =
+    \\<column>
+    \\  <terminal pty="{shell}" scrollback="{offset}" grow="1" label="Build shell" on-terminal="term_state"/>
+    \\</column>
+;
+
+pub const TerminalElementUi = canvas.Ui(TerminalElementMsg);
+
+/// The hand-written equivalent of the terminal markup: `ui.terminal`
+/// with the same options, the parity baseline the compiled suite shares.
+pub fn handTerminalElementView(ui: *TerminalElementUi, model: *const TerminalElementModel) TerminalElementUi.Node {
+    return ui.column(.{}, .{
+        ui.terminal(.{
+            .pty = model.shell,
+            .scrollback = model.offset,
+            .grow = 1,
+            .semantics = .{ .label = "Build shell" },
+            .on_terminal = TerminalElementUi.terminalMsg(.term_state),
+        }),
+    });
+}
+
+/// The first widget of the given kind in the tree, or null.
+pub fn findWidgetKind(widget: canvas.Widget, kind: canvas.WidgetKind) ?canvas.Widget {
+    if (widget.kind == kind) return widget;
+    for (widget.children) |child| {
+        if (findWidgetKind(child, kind)) |found| return found;
+    }
+    return null;
+}
+
+test "the terminal element binds its pty key, scrollback echo, and view-state handler" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const model = TerminalElementModel{};
+    var view = try markup_view.MarkupView(TerminalElementModel, TerminalElementMsg).init(arena, terminal_markup_source);
+    var ui = TerminalElementUi.init(arena);
+    const tree = try ui.finalize(try view.build(&ui, &model));
+
+    const widget = findWidgetKind(tree.root, .terminal) orelse return error.TestExpectedTerminal;
+    try testing.expectEqual(@as(u64, 7), widget.terminal.pty);
+    try testing.expectEqual(@as(u32, 4), widget.terminal.scrollback);
+    // No lookup installed (a bare builder): the widget renders unbound
+    // and the author's label stays the accessible name.
+    try testing.expect(widget.terminal.grid == null);
+    try testing.expectEqualStrings("Build shell", widget.semantics.label);
+
+    // The view-state handler resolves through the tree and carries the
+    // applied state.
+    const msg = tree.msgForTerminal(widget.id, .{ .scrollback = 12, .history = 40, .cols = 80, .rows = 24 }) orelse return error.TestExpectedHandler;
+    try testing.expectEqual(@as(u32, 12), msg.term_state.scrollback);
+    try testing.expectEqual(@as(u32, 40), msg.term_state.history);
+    try testing.expectEqual(@as(u16, 80), msg.term_state.cols);
+    try testing.expectEqual(@as(u16, 24), msg.term_state.rows);
+}
+
+test "the interpreter enforces the terminal leaf shape without the validator" {
+    // Hot reload builds without a validation pass: the build itself must
+    // refuse a pty-less terminal (dead markup) and terminal children (no
+    // child slots), exactly like the image leaf.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const model = TerminalElementModel{};
+
+    const missing_pty =
+        \\<column>
+        \\  <terminal label="Shell"/>
+        \\</column>
+    ;
+    var missing_view = try markup_view.MarkupView(TerminalElementModel, TerminalElementMsg).init(arena, missing_pty);
+    var missing_ui = TerminalElementUi.init(arena);
+    try testing.expectError(error.MarkupBuild, missing_view.build(&missing_ui, &model));
+    try testing.expectEqualStrings(canvas.ui_markup.terminal_missing_pty_message, missing_view.diagnostic.message);
+
+    const with_child =
+        \\<column>
+        \\  <terminal pty="{shell}" label="Shell"><button>Run</button></terminal>
+        \\</column>
+    ;
+    var child_view = try markup_view.MarkupView(TerminalElementModel, TerminalElementMsg).init(arena, with_child);
+    var child_ui = TerminalElementUi.init(arena);
+    try testing.expectError(error.MarkupBuild, child_view.build(&child_ui, &model));
+    try testing.expectEqualStrings(canvas.ui_markup.terminal_children_message, child_view.diagnostic.message);
+
+    const misplaced_scrollback =
+        \\<column>
+        \\  <panel scrollback="3"/>
+        \\</column>
+    ;
+    var scoped_view = try markup_view.MarkupView(TerminalElementModel, TerminalElementMsg).init(arena, misplaced_scrollback);
+    var scoped_ui = TerminalElementUi.init(arena);
+    try testing.expectError(error.MarkupBuild, scoped_view.build(&scoped_ui, &model));
+    try testing.expectEqualStrings(canvas.ui_markup.scrollback_element_message, scoped_view.diagnostic.message);
+}
+
+test "on-terminal requires a bare tag: an authored payload is refused" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The runtime supplies the TerminalState, so `term_state:{offset}`
+    // is dead data — refused with the payload teaching, not silently
+    // discarded.
+    const source =
+        \\<column>
+        \\  <terminal pty="{shell}" label="Shell" on-terminal="term_state:{offset}"/>
+        \\</column>
+    ;
+    var view = try markup_view.MarkupView(TerminalElementModel, TerminalElementMsg).init(arena, source);
+    var ui = TerminalElementUi.init(arena);
+    const model = TerminalElementModel{};
+    try testing.expectError(error.MarkupBuild, view.build(&ui, &model));
+    try testing.expectEqualStrings(canvas.ui_markup.on_terminal_payload_message, view.diagnostic.message);
+}
+
 test "the video element lowers to the playback surface with house chrome and records the declaration" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
