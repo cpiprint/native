@@ -12,7 +12,10 @@
 //! tell the two lanes apart:
 //!
 //! - bytes spell `[]const u8`; numbers spell `f64` or `i64` per the
-//!   sidecar's per-slot class; enums are `enum(u8)` with explicit
+//!   sidecar's per-slot class — `u64` where the slot's integer_slots
+//!   attestation refines the i64 spelling to the unsigned class, so the
+//!   decoder reads the slot's 8 wire bytes unsigned; every non-attested
+//!   numeric slot stays f64. Enums are `enum(u8)` with explicit
 //!   declaration-order values; node references spell `*const T`.
 //! - The message union is `union(enum)` in sidecar arm order — the arm
 //!   index IS the wire tag.
@@ -109,6 +112,7 @@ const Emitter = struct {
         try self.validateEmissionNames();
         self.validateChannelShapes();
         try self.validateArmStorage();
+        try self.validateIntegerAttestations();
         if (self.diags.hasErrors()) return;
         self.inlined = try self.inlinedNames();
         try self.header();
@@ -464,6 +468,117 @@ const Emitter = struct {
         });
     }
 
+    // ------------------------------------------- attested integer class
+    //
+    // The sidecar's one integer TypeRef spelling is i64; the matching
+    // integer_slots entry may refine it to the u64 class, and the
+    // mirror must decode what the attestation says (8-byte unsigned LE
+    // instead of two's complement). The reader validates the bijection
+    // before emission ever runs, so a lookup miss here simply means the
+    // slot keeps its i64 spelling.
+
+    fn attestedClass(self: *Emitter, slot: []const u8) ?sidecar_mod.IntegerClass {
+        for (self.sidecar.integer_slots) |entry| {
+            if (std.mem.eql(u8, entry.slot, slot)) return entry.class;
+        }
+        return null;
+    }
+
+    /// The Zig spelling of an i64-spelled slot, per its attestation.
+    fn integerSpelling(self: *Emitter, slot: ?[]const u8) []const u8 {
+        const path = slot orelse return "i64";
+        const class = self.attestedClass(path) orelse return "i64";
+        return @tagName(class);
+    }
+
+    /// The exact-crossing conversion for an integer-classed dispatch
+    /// payload (the scalar entries carry f64): the signed guard or its
+    /// unsigned twin, per the slot's attested class.
+    fn exactCall(self: *Emitter, slot: []const u8, inner: []const u8) Error![]const u8 {
+        const converter = if (self.attestedClass(slot) == .u64) "exactF64Unsigned" else "exactF64";
+        return std.fmt.allocPrint(self.arena, "shim_rt.{s}({s})", .{ converter, inner });
+    }
+
+    /// A slot path in the sidecar's grammar: `<Container>.<member>`.
+    fn slotPath(self: *Emitter, container: []const u8, member: []const u8) Error![]const u8 {
+        return std.fmt.allocPrint(self.arena, "{s}.{s}", .{ container, member });
+    }
+
+    /// A number_bytes arm's number-field slot path:
+    /// `<msgName>.<arm>.<field>`.
+    fn numberBytesSlot(self: *Emitter, arm: []const u8, field: []const u8) Error![]const u8 {
+        return std.fmt.allocPrint(self.arena, "{s}.{s}.{s}", .{ self.sidecar.msg.name, arm, field });
+    }
+
+    /// The Zig spelling of a number descriptor's payload, per class and
+    /// attestation.
+    fn numberSpelling(self: *Emitter, class: sidecar_mod.NumberClass, slot: []const u8) Error![]const u8 {
+        return switch (class) {
+            .f64 => "f64",
+            .i64 => self.integerSpelling(slot),
+        };
+    }
+
+    // ------------------------------------ host-supplied signed slots
+    //
+    // Two structural vocabularies carry slots the HOST fills with
+    // values that go negative: a scroll arm's offsets and velocities
+    // (rubber-banding, upward flicks) and the window-control cluster's
+    // position (signed content coordinates). A u64 attestation on such
+    // a slot could never carry those values — the generated wiring
+    // would trap converting them — so the checker refuses the
+    // attestation at tool time instead. Everything the host supplies
+    // non-negative stays attestable: scroll extents, selection bounds,
+    // chrome insets and cluster sizes — and a scroll-shaped record the
+    // host never dispatches into (a model-only metrics record) is not
+    // this rule's business at all.
+
+    /// The scroll-state axes the host supplies signed, in both
+    /// spellings (the TS mirror's and the canvas core's).
+    const signed_scroll_axes = [_][]const u8{
+        "offsetX",  "offsetY",  "velocityX",  "velocityY",
+        "offset_x", "offset_y", "velocity_x", "velocity_y",
+    };
+
+    fn validateIntegerAttestations(self: *Emitter) Error!void {
+        // Only records a message arm routes through the scroll entry
+        // receive host scroll values.
+        for (self.sidecar.msg.arms) |arm| {
+            const record_name = switch (arm.payload) {
+                .record => |name| name,
+                else => continue,
+            };
+            if (self.scrollStateFields(record_name) == null) continue;
+            const entry = sidecar_mod.findStruct(self.sidecar.types, record_name) orelse continue;
+            for (entry.fields) |field| {
+                if (field.type != .i64) continue;
+                if (!nameListed(&signed_scroll_axes, field.name)) continue;
+                const slot = try self.slotPath(entry.name, field.name);
+                if (self.attestedClass(slot) == .u64) {
+                    self.diags.flag("integer_slots", "\"{s}\" is a signed scroll-state axis (offsets and velocities go negative during rubber-banding and upward flicks) — the u64 class cannot carry those values; keep offset and velocity fields i64 or f64", .{slot});
+                }
+            }
+        }
+        if (self.sidecar.channels.chrome_msg) |arm_name| {
+            if (self.channelArmRecord(arm_name)) |record| {
+                for (record.fields) |field| {
+                    // Insets and cluster sizes are non-negative overlay
+                    // extents; only the cluster's position is signed.
+                    if (!std.mem.eql(u8, field.name, "buttons")) continue;
+                    const nested = self.recordOf(field.type) orelse continue;
+                    for (nested.fields) |geometry| {
+                        if (geometry.type != .i64) continue;
+                        if (!std.mem.eql(u8, geometry.name, "x") and !std.mem.eql(u8, geometry.name, "y")) continue;
+                        const slot = try self.slotPath(nested.name, geometry.name);
+                        if (self.attestedClass(slot) == .u64) {
+                            self.diags.flag("integer_slots", "\"{s}\" is the window-control cluster's position, reported in signed content coordinates — the u64 class cannot carry it; keep buttons x and y i64 or f64", .{slot});
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // --------------------------------------------------- mirror types
 
     /// Inline a table entry only when the pattern matches AND the entry
@@ -491,7 +606,7 @@ const Emitter = struct {
             if (nameListed(inlined, entry.name)) continue;
             try self.print("\npub const {f} = struct {{", .{ident(entry.name)});
             for (entry.fields) |field| {
-                try self.print("\n    {f}: {s},", .{ ident(field.name), try self.spellRef(field.type, entry.name, field.name) });
+                try self.print("\n    {f}: {s},", .{ ident(field.name), try self.spellRef(field.type, entry.name, field.name, try self.slotPath(entry.name, field.name)) });
             }
             try self.raw("\n};\n");
         }
@@ -502,7 +617,7 @@ const Emitter = struct {
                 if (arm.payload == .void) {
                     try self.print("\n    {f},", .{ident(arm.name)});
                 } else {
-                    try self.print("\n    {f}: {s},", .{ ident(arm.name), try self.spellRef(arm.payload, entry.name, arm.name) });
+                    try self.print("\n    {f}: {s},", .{ ident(arm.name), try self.spellRef(arm.payload, entry.name, arm.name, try self.slotPath(entry.name, arm.name)) });
                 }
             }
             try self.raw("\n};\n");
@@ -510,16 +625,20 @@ const Emitter = struct {
     }
 
     /// The one TypeRef-to-Zig-spelling authority. `container`/`member`
-    /// name the reference site so synthesized entries inline here.
-    fn spellRef(self: *Emitter, ref: TypeRef, container: []const u8, member: []const u8) Error![]const u8 {
+    /// name the reference site so synthesized entries inline here;
+    /// `slot` is the site's slot path in the sidecar's grammar (null
+    /// where no path form exists), consulted for the attested integer
+    /// class. Slice elements have no slot path — the format-1 grammar
+    /// cannot attest them, so they always keep the i64 spelling.
+    fn spellRef(self: *Emitter, ref: TypeRef, container: []const u8, member: []const u8, slot: ?[]const u8) Error![]const u8 {
         return switch (ref) {
             .bool => "bool",
             .f64 => "f64",
-            .i64 => "i64",
+            .i64 => self.integerSpelling(slot),
             .bytes => "[]const u8",
             .void => "void",
-            .optional => |inner| try std.fmt.allocPrint(self.arena, "?{s}", .{try self.spellRef(inner.*, container, member)}),
-            .slice => |elem| try std.fmt.allocPrint(self.arena, "[]const {s}", .{try self.spellRef(elem.*, container, member)}),
+            .optional => |inner| try std.fmt.allocPrint(self.arena, "?{s}", .{try self.spellRef(inner.*, container, member, slot)}),
+            .slice => |elem| try std.fmt.allocPrint(self.arena, "[]const {s}", .{try self.spellRef(elem.*, container, member, null)}),
             .node => |name| try std.fmt.allocPrint(self.arena, "*const {s}", .{try self.spellNamed(name, container, member)}),
             .value => |name| try self.spellNamed(name, container, member),
             .enum_ref, .union_ref => |name| try std.fmt.allocPrint(self.arena, "{f}", .{ident(name)}),
@@ -536,7 +655,7 @@ const Emitter = struct {
         try text.appendSlice(self.arena, "struct {");
         for (entry.fields, 0..) |field, index| {
             if (index > 0) try text.appendSlice(self.arena, ",");
-            const piece = try std.fmt.allocPrint(self.arena, " {f}: {s}", .{ ident(field.name), try self.spellRef(field.type, entry.name, field.name) });
+            const piece = try std.fmt.allocPrint(self.arena, " {f}: {s}", .{ ident(field.name), try self.spellRef(field.type, entry.name, field.name, try self.slotPath(entry.name, field.name)) });
             try text.appendSlice(self.arena, piece);
         }
         try text.appendSlice(self.arena, " }");
@@ -552,11 +671,11 @@ const Emitter = struct {
         };
         try self.print("\npub const {f} = struct {{", .{ident(model.name)});
         for (model.fields) |field| {
-            try self.print("\n    {f}: {s},", .{ ident(field.name), try self.spellRef(field.type, model.name, field.name) });
+            try self.print("\n    {f}: {s},", .{ ident(field.name), try self.spellRef(field.type, model.name, field.name, try self.slotPath(model.name, field.name)) });
         }
         if (self.sidecar.model_helpers.len > 0) try self.raw("\n");
         for (self.sidecar.model_helpers, 0..) |helper, index| {
-            const returns = try self.spellRef(helper.returns, "helpers", helper.name);
+            const returns = try self.spellRef(helper.returns, "helpers", helper.name, try std.fmt.allocPrint(self.arena, "helpers.{s}.return", .{helper.name}));
             if (helper.arena) {
                 // The build-arena scalar form: the view build hands its
                 // arena; the decoded result lives there.
@@ -575,7 +694,7 @@ const Emitter = struct {
                 var params: std.ArrayListUnmanaged(u8) = .empty;
                 var tuple: std.ArrayListUnmanaged(u8) = .empty;
                 for (helper.params, 0..) |param, param_index| {
-                    const spelled = try self.spellRef(param, "helpers", helper.name);
+                    const spelled = try self.spellRef(param, "helpers", helper.name, try std.fmt.allocPrint(self.arena, "helpers.{s}.params[{d}]", .{ helper.name, param_index }));
                     try params.appendSlice(self.arena, try std.fmt.allocPrint(self.arena, ", p{d}: {s}", .{ param_index, spelled }));
                     if (param_index > 0) try tuple.appendSlice(self.arena, ", ");
                     try tuple.appendSlice(self.arena, try std.fmt.allocPrint(self.arena, "p{d}", .{param_index}));
@@ -605,17 +724,17 @@ const Emitter = struct {
             switch (arm.payload) {
                 .void => try self.print("\n    {f},", .{ident(arm.name)}),
                 .bytes => try self.print("\n    {f}: []const u8,", .{ident(arm.name)}),
-                .number => |class| try self.print("\n    {f}: {s},", .{ ident(arm.name), @tagName(class) }),
+                .number => |class| try self.print("\n    {f}: {s},", .{ ident(arm.name), try self.numberSpelling(class, try self.slotPath(self.sidecar.msg.name, arm.name)) }),
                 // The two-field family carries no field-order fact; the
                 // mirror declares the number field first, the emitted
                 // convention of every producer of this shape. A record
                 // declared bytes-first must ride the record family (its
                 // table entry carries order explicitly) — see
                 // SCHEMA-GAPS.md.
-                .number_bytes => |desc| try self.print("\n    {f}: struct {{ {f}: {s}, {f}: []const u8 }},", .{ ident(arm.name), ident(desc.number_field), @tagName(desc.number_class), ident(desc.bytes_field) }),
+                .number_bytes => |desc| try self.print("\n    {f}: struct {{ {f}: {s}, {f}: []const u8 }},", .{ ident(arm.name), ident(desc.number_field), try self.numberSpelling(desc.number_class, try self.numberBytesSlot(arm.name, desc.number_field)), ident(desc.bytes_field) }),
                 .record => |name| try self.print("\n    {f}: {s},", .{ ident(arm.name), try self.spellNamed(name, self.sidecar.msg.name, arm.name) }),
                 .union_ref, .enum_ref => |name| try self.print("\n    {f}: {f},", .{ ident(arm.name), ident(name) }),
-                .scalar => |ref| try self.print("\n    {f}: {s},", .{ ident(arm.name), try self.spellRef(ref, self.sidecar.msg.name, arm.name) }),
+                .scalar => |ref| try self.print("\n    {f}: {s},", .{ ident(arm.name), try self.spellRef(ref, self.sidecar.msg.name, arm.name, try self.slotPath(self.sidecar.msg.name, arm.name)) }),
             }
         }
         try self.unboundDecl(self.sidecar.msg.unbound);
@@ -798,12 +917,12 @@ const Emitter = struct {
             .bytes => try self.print("        .{s} => |payload| abi.dispatch_bytes({d}, payload.ptr, payload.len, &cmd_ptr, &cmd_len),\n", .{ name, tag }),
             .number => |class| switch (class) {
                 .f64 => try self.print("        .{s} => |payload| abi.dispatch_number({d}, payload, &cmd_ptr, &cmd_len),\n", .{ name, tag }),
-                .i64 => try self.print("        .{s} => |payload| abi.dispatch_number({d}, shim_rt.exactF64(payload), &cmd_ptr, &cmd_len),\n", .{ name, tag }),
+                .i64 => try self.print("        .{s} => |payload| abi.dispatch_number({d}, {s}, &cmd_ptr, &cmd_len),\n", .{ name, tag, try self.exactCall(try self.slotPath(self.sidecar.msg.name, arm.name), "payload") }),
             },
             .number_bytes => |desc| {
                 const number_expr = switch (desc.number_class) {
                     .f64 => try std.fmt.allocPrint(self.arena, "payload.{f}", .{ident(desc.number_field)}),
-                    .i64 => try std.fmt.allocPrint(self.arena, "shim_rt.exactF64(payload.{f})", .{ident(desc.number_field)}),
+                    .i64 => try self.exactCall(try self.numberBytesSlot(arm.name, desc.number_field), try std.fmt.allocPrint(self.arena, "payload.{f}", .{ident(desc.number_field)})),
                 };
                 try self.print("        .{s} => |payload| abi.dispatch_number_bytes({d}, {s}, payload.{f}.ptr, payload.{f}.len, &cmd_ptr, &cmd_len),\n", .{ name, tag, number_expr, ident(desc.bytes_field), ident(desc.bytes_field) });
             },
@@ -822,7 +941,7 @@ const Emitter = struct {
                         if (index > 0) try scalars.appendSlice(self.arena, ", ");
                         const record = sidecar_mod.findStruct(self.sidecar.types, type_name).?;
                         const expr = switch (record.fields[field].type) {
-                            .i64 => try std.fmt.allocPrint(self.arena, "shim_rt.exactF64(payload.{f})", .{ident(record.fields[field].name)}),
+                            .i64 => try self.exactCall(try self.slotPath(type_name, record.fields[field].name), try std.fmt.allocPrint(self.arena, "payload.{f}", .{ident(record.fields[field].name)})),
                             else => try std.fmt.allocPrint(self.arena, "payload.{f}", .{ident(record.fields[field].name)}),
                         };
                         try scalars.appendSlice(self.arena, expr);
@@ -835,7 +954,7 @@ const Emitter = struct {
             .scalar => |ref| switch (ref) {
                 .bool => try self.print("        .{s} => |payload| abi.dispatch_bool({d}, @intFromBool(payload), &cmd_ptr, &cmd_len),\n", .{ name, tag }),
                 .f64 => try self.print("        .{s} => |payload| abi.dispatch_number({d}, payload, &cmd_ptr, &cmd_len),\n", .{ name, tag }),
-                .i64 => try self.print("        .{s} => |payload| abi.dispatch_number({d}, shim_rt.exactF64(payload), &cmd_ptr, &cmd_len),\n", .{ name, tag }),
+                .i64 => try self.print("        .{s} => |payload| abi.dispatch_number({d}, {s}, &cmd_ptr, &cmd_len),\n", .{ name, tag, try self.exactCall(try self.slotPath(self.sidecar.msg.name, arm.name), "payload") }),
                 .bytes => try self.print("        .{s} => |payload| abi.dispatch_bytes({d}, payload.ptr, payload.len, &cmd_ptr, &cmd_len),\n", .{ name, tag }),
                 else => self.diags.flag("msg.arms", "arm \"{s}\": ABI version 1 has no dispatch entry for this scalar shape (bool, number, and bytes scalars only)", .{arm.name}),
             },
@@ -1387,6 +1506,295 @@ test "emission is deterministic and carries the mirror surface" {
     // A bare-model init emits the pointer-returning shape.
     try testing.expect(std.mem.indexOf(u8, first, "pub fn initialModel() *const Model {") != null);
     try testing.expect(std.mem.indexOf(u8, first, "pub const UpdateResult = struct { model: *const Model, cmd: rt.Cmd };") != null);
+}
+
+test "u64-attested slots generate the unsigned twin; i64 and f64 slots are untouched" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Every slot-path form the grammar can attest, classes mixed: the
+    // attested class decides the mirror's decode width per slot, and
+    // nothing leaks across slots.
+    var source = try std.mem.replaceOwned(
+        u8,
+        arena,
+        sidecar_mod.minimal_valid_json,
+        "{\"name\": \"count\", \"type\": {\"kind\": \"i64\"}}",
+        "{\"name\": \"count\", \"type\": {\"kind\": \"i64\"}},\n        {\"name\": \"delta\", \"type\": {\"kind\": \"i64\"}},\n        {\"name\": \"ratio\", \"type\": {\"kind\": \"f64\"}}",
+    );
+    source = try std.mem.replaceOwned(
+        u8,
+        arena,
+        source,
+        "{\"name\": \"bump\", \"payload\": {\"kind\": \"void\"}}",
+        "{\"name\": \"tick\", \"payload\": {\"kind\": \"number\", \"class\": \"i64\"}},\n      {\"name\": \"stepped\", \"payload\": {\"kind\": \"number\", \"class\": \"i64\"}},\n      {\"name\": \"fetched\", \"payload\": {\"kind\": \"number_bytes\", \"number_field\": \"status\", \"number_class\": \"i64\", \"bytes_field\": \"body\"}}",
+    );
+    source = try std.mem.replaceOwned(
+        u8,
+        arena,
+        source,
+        "\"model_helpers\": []",
+        "\"model_helpers\": [{\"name\": \"peak\", \"params\": [], \"returns\": {\"kind\": \"i64\"}, \"arena\": false}]",
+    );
+    source = try std.mem.replaceOwned(
+        u8,
+        arena,
+        source,
+        "{\"slot\": \"Model.count\", \"class\": \"i64\"}",
+        \\{"slot": "Model.count", "class": "u64"},
+        \\    {"slot": "Model.delta", "class": "i64"},
+        \\    {"slot": "Msg.tick", "class": "u64"},
+        \\    {"slot": "Msg.stepped", "class": "i64"},
+        \\    {"slot": "Msg.fetched.status", "class": "u64"},
+        \\    {"slot": "helpers.peak.return", "class": "u64"}
+        ,
+    );
+    const generated = try emitFromJson(arena, source);
+    // Mirror spellings follow the attestation, slot by slot.
+    try testing.expect(std.mem.indexOf(u8, generated, "count: u64,") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "delta: i64,") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "ratio: f64,") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "tick: u64,") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "stepped: i64,") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "fetched: struct { status: u64, body: []const u8 },") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "pub fn peak(self: *const Model) u64 {") != null);
+    // Dispatch narrows through the matching exactness guard.
+    try testing.expect(std.mem.indexOf(u8, generated, "abi.dispatch_number(0, shim_rt.exactF64Unsigned(payload), &cmd_ptr, &cmd_len)") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "abi.dispatch_number(1, shim_rt.exactF64(payload), &cmd_ptr, &cmd_len)") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "abi.dispatch_number_bytes(2, shim_rt.exactF64Unsigned(payload.status), payload.body.ptr, payload.body.len, &cmd_ptr, &cmd_len)") != null);
+    // The generated module stays valid Zig.
+    const source_z = try arena.dupeZ(u8, generated);
+    const tree = try std.zig.Ast.parse(arena, source_z, .zig);
+    try testing.expectEqual(@as(usize, 0), tree.errors.len);
+}
+
+test "u64 attestations on host-supplied signed slots refuse at check time" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A scroll-state record with a u64-attested axis: scroll translation
+    // supplies negative offsets and velocities, which the unsigned class
+    // cannot carry — refused before any wiring generates.
+    const scroll_struct =
+        \\      {"name": "Scroll", "fields": [
+        \\        {"name": "offsetX", "type": {"kind": "f64"}},
+        \\        {"name": "offsetY", "type": {"kind": "i64"}},
+        \\        {"name": "velocityX", "type": {"kind": "f64"}},
+        \\        {"name": "velocityY", "type": {"kind": "f64"}},
+        \\        {"name": "viewportExtentX", "type": {"kind": "f64"}},
+        \\        {"name": "viewportExtentY", "type": {"kind": "f64"}},
+        \\        {"name": "contentExtentX", "type": {"kind": "f64"}},
+        \\        {"name": "contentExtentY", "type": {"kind": "f64"}}
+        \\      ]},
+    ;
+    var source = try std.mem.replaceOwned(
+        u8,
+        arena,
+        sidecar_mod.minimal_valid_json,
+        "\"structs\": [\n",
+        try std.fmt.allocPrint(arena, "\"structs\": [\n{s}\n", .{scroll_struct}),
+    );
+    source = try std.mem.replaceOwned(
+        u8,
+        arena,
+        source,
+        "{\"name\": \"bump\", \"payload\": {\"kind\": \"void\"}}",
+        "{\"name\": \"bump\", \"payload\": {\"kind\": \"void\"}},\n      {\"name\": \"scrolled\", \"payload\": {\"kind\": \"record\", \"name\": \"Scroll\"}}",
+    );
+    source = try std.mem.replaceOwned(u8, arena, source, "{\"slot\": \"Model.count\", \"class\": \"i64\"}", "{\"slot\": \"Model.count\", \"class\": \"i64\"}, {\"slot\": \"Scroll.offsetY\", \"class\": \"u64\"}");
+    var diags = sidecar_mod.Diagnostics{ .arena = arena };
+    const parsed = try sidecar_mod.read(arena, source, &diags);
+    try testing.expectError(error.Refused, emit(arena, parsed, &diags));
+    var found = false;
+    for (diags.list.items) |item| {
+        if (item.severity == .@"error" and std.mem.indexOf(u8, item.message, "scroll-state axis") != null) found = true;
+    }
+    try testing.expect(found);
+    // The same record i64-attested generates: only the unsigned class
+    // is incoherent with the host's signed values.
+    const signed = try std.mem.replaceOwned(u8, arena, source, "{\"slot\": \"Scroll.offsetY\", \"class\": \"u64\"}", "{\"slot\": \"Scroll.offsetY\", \"class\": \"i64\"}");
+    const generated = try emitFromJson(arena, signed);
+    try testing.expect(std.mem.indexOf(u8, generated, "abi.dispatch_scroll_state(1,") != null);
+
+    // Extents stay attestable: the host only ever supplies viewport and
+    // content sizes non-negative, so the unsigned class carries them.
+    var extent_source = try std.mem.replaceOwned(u8, arena, source, "{\"name\": \"offsetY\", \"type\": {\"kind\": \"i64\"}}", "{\"name\": \"offsetY\", \"type\": {\"kind\": \"f64\"}}");
+    extent_source = try std.mem.replaceOwned(u8, arena, extent_source, "{\"name\": \"viewportExtentY\", \"type\": {\"kind\": \"f64\"}}", "{\"name\": \"viewportExtentY\", \"type\": {\"kind\": \"i64\"}}");
+    extent_source = try std.mem.replaceOwned(u8, arena, extent_source, "{\"slot\": \"Scroll.offsetY\", \"class\": \"u64\"}", "{\"slot\": \"Scroll.viewportExtentY\", \"class\": \"u64\"}");
+    const extent_generated = try emitFromJson(arena, extent_source);
+    try testing.expect(std.mem.indexOf(u8, extent_generated, "shim_rt.exactF64Unsigned(payload.viewportExtentY)") != null);
+
+    // A scroll-shaped record no message arm routes is not scroll state
+    // to the host: a model-only metrics record keeps its unsigned
+    // attestation even on an axis-named field.
+    var model_only = try std.mem.replaceOwned(
+        u8,
+        arena,
+        source,
+        "{\"name\": \"bump\", \"payload\": {\"kind\": \"void\"}},\n      {\"name\": \"scrolled\", \"payload\": {\"kind\": \"record\", \"name\": \"Scroll\"}}",
+        "{\"name\": \"bump\", \"payload\": {\"kind\": \"void\"}}",
+    );
+    model_only = try std.mem.replaceOwned(
+        u8,
+        arena,
+        model_only,
+        "{\"name\": \"label\", \"type\": {\"kind\": \"bytes\"}}",
+        "{\"name\": \"label\", \"type\": {\"kind\": \"bytes\"}}, {\"name\": \"metrics\", \"type\": {\"kind\": \"value\", \"name\": \"Scroll\"}}",
+    );
+    const model_only_generated = try emitFromJson(arena, model_only);
+    try testing.expect(std.mem.indexOf(u8, model_only_generated, "offsetY: u64,") != null);
+}
+
+test "a u64 attestation on chrome geometry refuses at check time" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A wired chrome arm whose buttons record attests x as u64:
+    // embedders report signed content coordinates, which the unsigned
+    // class cannot carry.
+    const source =
+        \\{
+        \\  "format": 1, "wire_version": 3, "abi_version": 1,
+        \\  "compiler_version": "0.0.1", "entry": "src/core.ts",
+        \\  "source_hash": "00000000c0ffee00", "build_id": "00000000b01dface",
+        \\  "types": {
+        \\    "structs": [
+        \\      {"name": "Model", "fields": [{"name": "chromeTop", "type": {"kind": "f64"}}]},
+        \\      {"name": "Insets", "fields": [
+        \\        {"name": "top", "type": {"kind": "f64"}}, {"name": "right", "type": {"kind": "f64"}},
+        \\        {"name": "bottom", "type": {"kind": "f64"}}, {"name": "left", "type": {"kind": "f64"}}
+        \\      ]},
+        \\      {"name": "Buttons", "fields": [
+        \\        {"name": "x", "type": {"kind": "i64"}}, {"name": "y", "type": {"kind": "f64"}},
+        \\        {"name": "width", "type": {"kind": "f64"}}, {"name": "height", "type": {"kind": "f64"}}
+        \\      ]},
+        \\      {"name": "Msg_chrome_changed", "fields": [
+        \\        {"name": "insets", "type": {"kind": "value", "name": "Insets"}},
+        \\        {"name": "buttons", "type": {"kind": "value", "name": "Buttons"}},
+        \\        {"name": "tabsProjected", "type": {"kind": "bool"}}
+        \\      ]}
+        \\    ],
+        \\    "enums": [], "unions": []
+        \\  },
+        \\  "model": "Model", "model_helpers": [], "model_unbound": [],
+        \\  "msg": {"name": "Msg", "arms": [
+        \\    {"name": "chrome_changed", "payload": {"kind": "record", "name": "Msg_chrome_changed"}}
+        \\  ], "unbound": []},
+        \\  "init_returns_cmd": false, "update_returns_cmd": true, "has_subscriptions": false,
+        \\  "channels": {"command_msg": false, "frame_msg": false, "key_msg": false, "pinch_msg": false,
+        \\    "appearance_msg": null, "chrome_msg": "chrome_changed", "env_msgs": []},
+        \\  "abi": {"prefix": "nsc_core_", "exports": ["abi_version", "build_id", "set_panic_sink", "init",
+        \\    "collect", "frame_reset", "boot_cmd", "dispatch_void", "dispatch_bytes", "dispatch_number",
+        \\    "dispatch_number_bytes", "dispatch_bool", "dispatch_enum", "dispatch_record",
+        \\    "dispatch_text_input", "dispatch_scroll_state", "subscriptions", "model_snapshot",
+        \\    "helper_call"], "snapshot_format": 1},
+        \\  "integer_slots": [{"slot": "Buttons.x", "class": "u64"}],
+        \\  "deterministic": true, "async_free": true
+        \\}
+    ;
+    var diags = sidecar_mod.Diagnostics{ .arena = arena };
+    const parsed = try sidecar_mod.read(arena, source, &diags);
+    try testing.expectError(error.Refused, emit(arena, parsed, &diags));
+    var found = false;
+    for (diags.list.items) |item| {
+        if (item.severity == .@"error" and std.mem.indexOf(u8, item.message, "window-control cluster's position") != null) found = true;
+    }
+    try testing.expect(found);
+
+    // Insets and cluster sizes are non-negative overlay extents: the
+    // unsigned class carries them.
+    var arena_state2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state2.deinit();
+    const arena2 = arena_state2.allocator();
+    var extents = try std.mem.replaceOwned(u8, arena2, source, "{\"name\": \"x\", \"type\": {\"kind\": \"i64\"}}", "{\"name\": \"x\", \"type\": {\"kind\": \"f64\"}}");
+    extents = try std.mem.replaceOwned(u8, arena2, extents, "{\"name\": \"top\", \"type\": {\"kind\": \"f64\"}}", "{\"name\": \"top\", \"type\": {\"kind\": \"i64\"}}");
+    extents = try std.mem.replaceOwned(u8, arena2, extents, "{\"slot\": \"Buttons.x\", \"class\": \"u64\"}", "{\"slot\": \"Insets.top\", \"class\": \"u64\"}");
+    const generated = try emitFromJson(arena2, extents);
+    try testing.expect(std.mem.indexOf(u8, generated, "top: u64,") != null);
+}
+
+test "u64 attestations on selection bounds are accepted (the host supplies unsigned offsets)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The full text-input vocabulary with a u64-attested selection
+    // anchor: the engine's selection bounds are unsigned offsets (a
+    // backward selection is anchor > focus, never a negative index), so
+    // the unsigned class carries every host-supplied value.
+    const records =
+        \\      {"name": "Move", "fields": [
+        \\        {"name": "direction", "type": {"kind": "enum", "name": "Dir"}},
+        \\        {"name": "extend", "type": {"kind": "bool"}}
+        \\      ]},
+        \\      {"name": "Sel", "fields": [
+        \\        {"name": "anchor", "type": {"kind": "i64"}},
+        \\        {"name": "focus", "type": {"kind": "i64"}}
+        \\      ]},
+        \\      {"name": "Comp", "fields": [
+        \\        {"name": "text", "type": {"kind": "bytes"}},
+        \\        {"name": "cursor", "type": {"kind": "optional", "inner": {"kind": "i64"}}}
+        \\      ]},
+    ;
+    const union_entry =
+        \\"unions": [{"name": "Edit", "arms": [
+        \\      {"name": "insert_text", "payload": {"kind": "bytes"}},
+        \\      {"name": "delete_backward", "payload": {"kind": "void"}},
+        \\      {"name": "delete_forward", "payload": {"kind": "void"}},
+        \\      {"name": "delete_word_backward", "payload": {"kind": "void"}},
+        \\      {"name": "delete_word_forward", "payload": {"kind": "void"}},
+        \\      {"name": "clear", "payload": {"kind": "void"}},
+        \\      {"name": "move_caret", "payload": {"kind": "value", "name": "Move"}},
+        \\      {"name": "set_selection", "payload": {"kind": "value", "name": "Sel"}},
+        \\      {"name": "set_composition", "payload": {"kind": "value", "name": "Comp"}},
+        \\      {"name": "commit_composition", "payload": {"kind": "void"}},
+        \\      {"name": "cancel_composition", "payload": {"kind": "void"}}
+        \\    ]}]
+    ;
+    var source = try std.mem.replaceOwned(u8, arena, sidecar_mod.minimal_valid_json, "\"structs\": [\n", try std.fmt.allocPrint(arena, "\"structs\": [\n{s}\n", .{records}));
+    source = try std.mem.replaceOwned(u8, arena, source, "\"enums\": []", "\"enums\": [{\"name\": \"Dir\", \"members\": [\"previous\", \"next\", \"previous_word\", \"next_word\", \"start\", \"end\"]}]");
+    source = try std.mem.replaceOwned(u8, arena, source, "\"unions\": []", union_entry);
+    source = try std.mem.replaceOwned(
+        u8,
+        arena,
+        source,
+        "{\"name\": \"bump\", \"payload\": {\"kind\": \"void\"}}",
+        "{\"name\": \"edited\", \"payload\": {\"kind\": \"union\", \"name\": \"Edit\"}}",
+    );
+    source = try std.mem.replaceOwned(
+        u8,
+        arena,
+        source,
+        "{\"slot\": \"Model.count\", \"class\": \"i64\"}",
+        "{\"slot\": \"Model.count\", \"class\": \"i64\"}, {\"slot\": \"Sel.anchor\", \"class\": \"u64\"}, {\"slot\": \"Sel.focus\", \"class\": \"u64\"}, {\"slot\": \"Comp.cursor\", \"class\": \"u64\"}",
+    );
+    const generated = try emitFromJson(arena, source);
+    // The mirror spells the attested classes and the union still routes
+    // through the text-input entry (recognition is spelling-level).
+    try testing.expect(std.mem.indexOf(u8, generated, "anchor: u64,") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "focus: u64,") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "cursor: ?u64,") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "abi.dispatch_text_input(0,") != null);
+}
+
+test "the empty integer_slots list decodes nothing differently" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The f64-only sequencing: every numeric slot spelled f64, the
+    // empty list attested — the mirror carries f64 slots and no
+    // integer narrowing anywhere.
+    var source = try std.mem.replaceOwned(u8, arena, sidecar_mod.minimal_valid_json, "{\"name\": \"count\", \"type\": {\"kind\": \"i64\"}}", "{\"name\": \"count\", \"type\": {\"kind\": \"f64\"}}");
+    source = try std.mem.replaceOwned(u8, arena, source, "{\"name\": \"bump\", \"payload\": {\"kind\": \"void\"}}", "{\"name\": \"picked\", \"payload\": {\"kind\": \"number\", \"class\": \"f64\"}}");
+    source = try std.mem.replaceOwned(u8, arena, source, "{\"slot\": \"Model.count\", \"class\": \"i64\"}", "");
+    const generated = try emitFromJson(arena, source);
+    try testing.expect(std.mem.indexOf(u8, generated, "count: f64,") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "picked: f64,") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "abi.dispatch_number(0, payload, &cmd_ptr, &cmd_len)") != null);
+    // No integer narrowing and no integer-spelled mirror slot anywhere
+    // (the identity constants' own u64 plumbing is not a mirror slot).
+    try testing.expect(std.mem.indexOf(u8, generated, "exactF64") == null);
+    try testing.expect(std.mem.indexOf(u8, generated, ": i64,") == null);
+    try testing.expect(std.mem.indexOf(u8, generated, ": u64,") == null);
 }
 
 test "the emitted shim parses as Zig" {

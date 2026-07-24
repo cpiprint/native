@@ -65,6 +65,17 @@ fn referenceSnapshot(model: *const ts_core.Model, arena: std.mem.Allocator) ![]c
     return corewire_rt.encodeAlloc(shim_core.Model, converted, arena);
 }
 
+/// The selection sample follows the supplied sidecar's classes: a
+/// signed focus keeps the negative-value coverage, an unsigned one
+/// exercises a backward selection (anchor past focus) instead.
+const selection_sample = blk: {
+    const Selection = @FieldType(@FieldType(shim_core.Msg, "draft_edit"), "set_selection");
+    if (carriesNegatives(@FieldType(Selection, "focus"))) {
+        break :blk Selection{ .anchor = 1, .focus = -2 };
+    }
+    break :blk Selection{ .anchor = 3, .focus = 1 };
+};
+
 /// The scripted sequence: every dispatch entry class the fixture's
 /// contract declares — bare arms, i64- and f64-classed numbers, bytes,
 /// the text-input union (each payload family), and the three record
@@ -81,7 +92,7 @@ const script = [_]shim_core.Msg{
     .{ .draft_edit = .{ .insert_text = "hi" } },
     .{ .draft_edit = .delete_backward },
     .{ .draft_edit = .{ .move_caret = .{ .direction = .next_word, .extend = true } } },
-    .{ .draft_edit = .{ .set_selection = .{ .anchor = 1, .focus = -2 } } },
+    .{ .draft_edit = .{ .set_selection = selection_sample } },
     .{ .draft_edit = .{ .set_composition = .{ .text = "ab", .cursor = 1 } } },
     .{ .draft_edit = .{ .set_composition = .{ .text = "", .cursor = null } } },
     .{ .draft_edit = .clear },
@@ -193,6 +204,103 @@ fn channelParityCycle(
     ts_core.rt.frameReset();
     shim_core.rt.frameReset();
     return .{ .ts = next_ts, .shim = next_shim };
+}
+
+/// One dispatch cycle in both lanes over one message, comparing the
+/// command and snapshot byte surfaces.
+fn parityCycle(
+    arena: std.mem.Allocator,
+    ts_model: *const ts_core.Model,
+    shim_model: *const shim_core.Model,
+    msg: shim_core.Msg,
+) !struct { ts: *const ts_core.Model, shim: *const shim_core.Model } {
+    const ts_msg = try convertValue(ts_core.Msg, msg, arena);
+    const ts_out = ts_core.update(ts_model, ts_msg);
+    const next_ts = ts_core.commitModelRoot(ts_out.model);
+    const shim_out = shim_core.update(shim_model, msg);
+    const next_shim = shim_core.commitModelRoot(shim_out.model);
+    try testing.expectEqualSlices(u8, ts_out.cmd, shim_out.cmd);
+    try testing.expectEqualSlices(u8, try referenceSnapshot(next_ts, arena), rawSnapshot());
+    ts_core.rt.frameReset();
+    shim_core.rt.frameReset();
+    return .{ .ts = next_ts, .shim = next_shim };
+}
+
+test "integer-classed slots cross the compiler-provable extremes exactly" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A fresh boot in both lanes. When the archive rides a
+    // compiler-emitted sidecar with a populated integer_slots section,
+    // this test is the executable proof of the attested classes: the
+    // i64-classed arms carry the +-(2^53 - 1) extremes through a real
+    // dispatch, the archive's snapshot bytes must equal the canonical
+    // encoding of the transpiler lane's model, and the generated
+    // mirror's decode of those bytes must hold the exact integers.
+    ts_core.rt.resetAll();
+    shim_core.rt.resetAll();
+    var ts_model = ts_core.commitModelRoot(ts_core.initialModel());
+    var shim_model = shim_core.commitModelRoot(shim_core.initialModel());
+    ts_core.rt.frameReset();
+    shim_core.rt.frameReset();
+
+    // The extremes follow each slot's class in the supplied sidecar: a
+    // signed slot (i64-attested, or f64 in a sidecar predating integer
+    // attestation) also crosses the negative extreme; a u64-attested
+    // one stays within its unsigned range. Every crossing value sits
+    // within +-(2^53 - 1), so each class carries it exactly.
+    const max_exact = 9007199254740991; // 2^53 - 1
+    const boundary_script = comptime blk: {
+        var msgs: []const shim_core.Msg = &.{
+            .{ .canvas_resized = max_exact },
+            .{ .toggle = max_exact },
+        };
+        if (carriesNegatives(@FieldType(shim_core.Msg, "toggle"))) {
+            msgs = msgs ++ [_]shim_core.Msg{.{ .toggle = -max_exact }};
+        }
+        if (carriesNegatives(@FieldType(shim_core.Msg, "canvas_resized"))) {
+            msgs = msgs ++ [_]shim_core.Msg{.{ .canvas_resized = -max_exact }};
+        }
+        msgs = msgs ++ [_]shim_core.Msg{.{ .canvas_resized = 0 }};
+        break :blk msgs;
+    };
+    inline for (boundary_script, 0..) |msg, step| {
+        const next = parityCycle(arena, ts_model, shim_model, msg) catch |err| {
+            std.debug.print("integer boundary parity diverges at step {d} ({s})\n", .{ step, @tagName(msg) });
+            return err;
+        };
+        ts_model = next.ts;
+        shim_model = next.shim;
+        // The mirror decoded the committed snapshot: its numeric slot
+        // holds the exact crossing value (compared class-agnostically —
+        // the arm and the field each follow their own class, and every
+        // crossing value is f64-exact).
+        switch (msg) {
+            .canvas_resized => |value| try testing.expectEqual(exactValue(value), exactValue(shim_model.canvasWidth)),
+            else => {},
+        }
+    }
+}
+
+/// Whether a mirror slot's class carries negative values: signed
+/// integers and f64 do; the unsigned class does not.
+fn carriesNegatives(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .int => |info| info.signedness == .signed,
+        .float => true,
+        else => @compileError("not a numeric mirror slot: " ++ @typeName(T)),
+    };
+}
+
+/// A class-agnostic exact comparison value: every crossing this suite
+/// drives sits within +-(2^53 - 1), where f64 carries integers exactly.
+fn exactValue(value: anytype) f64 {
+    return switch (@typeInfo(@TypeOf(value))) {
+        .int => @floatFromInt(value),
+        .float => value,
+        else => @compileError("not a numeric mirror slot: " ++ @typeName(@TypeOf(value))),
+    };
 }
 
 test "channel entries match the transpiler lane through the bytes envelope" {
