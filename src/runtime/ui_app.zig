@@ -5445,7 +5445,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                                 const edit = keyboard_event.keyboard.textEditEvent() orelse return;
                                 if (edit != .insert_text) return;
                                 if (keyboard_event.terminal_paste) {
-                                    // Context-menu paste is provenance-
+                                    // Clipboard paste is provenance-
                                     // sensitive terminal input: the
                                     // session must apply bracketed-paste
                                     // framing and paste sanitization.
@@ -5467,6 +5467,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                         }
                     }
                 }
+                // A provenance-tagged terminal paste is terminal-addressed
+                // even when no enabled emulator is wired in this build.
+                // Never leak its clipboard bytes to app-level `on_text`.
+                if (keyboard_event.terminal_paste) return;
                 const text_map = self.options.on_text orelse return;
                 // COMMITTED text only. An IME preedit (`set_composition`)
                 // or a cancel is provisional and must never reach a

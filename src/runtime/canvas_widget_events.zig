@@ -1924,12 +1924,13 @@ pub fn RuntimeCanvasWidgetEvents(comptime Runtime: type) type {
         /// - cut: copy, then stamp a delete-selection edit onto the routed
         ///   keyboard event so runtime widget and app model apply the same
         ///   removal.
-        /// - paste: reads the clipboard into `paste_buffer`, sanitizes it
-        ///   for the target kind and THEN clamps to the view's text
-        ///   capacity (setting `edit_truncated` loudly) — order matters:
-        ///   clamping first would spend capacity on line-break bytes the
-        ///   seam strips anyway — and stamps the insertion onto the
-        ///   routed keyboard event.
+        /// - paste: a terminal target becomes provenance-tagged committed
+        ///   input for its dedicated VT paste encoder; editable text reads
+        ///   the clipboard into `paste_buffer`, sanitizes it for the target
+        ///   kind and THEN clamps to the view's text capacity (setting
+        ///   `edit_truncated` loudly) — order matters: clamping first would
+        ///   spend capacity on line-break bytes the seam strips anyway —
+        ///   and stamps the insertion onto the routed keyboard event.
         ///
         /// Platforms without a clipboard capability report
         /// `UnsupportedService`; the shortcut degrades to a no-op instead
@@ -1968,6 +1969,28 @@ pub fn RuntimeCanvasWidgetEvents(comptime Runtime: type) type {
                     const target = event.target orelse return;
                     const node_index = self.views[index].canvasWidgetNodeIndexById(target.id) orelse return;
                     const widget = self.views[index].widget_layout_nodes[node_index].widget;
+                    if (widget.kind == .terminal and !widget.state.disabled and widget.terminal.pty != 0) {
+                        // A terminal paste is committed input, but it must
+                        // stay distinct from typing: the session's paste
+                        // encoder owns bracketed-paste framing, newline
+                        // conversion, and unsafe-control stripping. Shape
+                        // the shortcut exactly like context-menu Paste.
+                        const focused_id = event.keyboard.focused_id;
+                        event.keyboard = .{ .phase = .text_input, .focused_id = focused_id };
+                        event.terminal_paste = true;
+                        self.views[index].canvas_widget_terminal_paste_v_held = true;
+
+                        // Mark the shortcut as consumed before touching
+                        // the clipboard. An unavailable/empty clipboard
+                        // must not turn Cmd+V into a key sent to the child.
+                        const grid = widget.terminal.grid orelse return;
+                        if (!grid.running) return;
+                        const text = self.readClipboard(paste_buffer) catch return;
+                        if (text.len == 0) return;
+                        event.keyboard.text = text;
+                        event.keyboard.edit = .{ .insert_text = text };
+                        return;
+                    }
                     if (!canvas_widget_runtime.canvasWidgetEditableTextKind(widget.kind) or widget.state.disabled) return;
                     // An empty or unavailable clipboard pastes nothing.
                     const text = self.readClipboard(paste_buffer) catch return;
@@ -2304,6 +2327,24 @@ pub fn RuntimeCanvasWidgetEvents(comptime Runtime: type) type {
                 self.views[index].canvas_widget_terminal_focus_entry_tab_held = false;
             }
             return true;
+        }
+
+        /// Consume the physical V release paired with a terminal Paste
+        /// shortcut. Modifier flags describe the release instant, not
+        /// the original key-down: Command/Ctrl may already be up, so the
+        /// key-down classification is latched on the view instead of
+        /// reconstructed here. A fresh V down retires a stale latch
+        /// first (native menu Paste synthesizes a down with no release);
+        /// the clipboard pass later in this input cycle re-arms it when
+        /// that fresh down is another terminal Paste.
+        pub fn consumeCanvasWidgetTerminalPasteKeyLifetime(self: *Runtime, input_event: GpuSurfaceInputEvent) bool {
+            if (input_event.kind != .key_down and input_event.kind != .key_up) return false;
+            if (!std.ascii.eqlIgnoreCase(input_event.key, "v")) return false;
+            const index = runtimeFindViewIndex(self, input_event.window_id, input_event.label) orelse return false;
+            if (self.views[index].kind != .gpu_surface) return false;
+            if (!self.views[index].canvas_widget_terminal_paste_v_held) return false;
+            self.views[index].canvas_widget_terminal_paste_v_held = false;
+            return input_event.kind == .key_up;
         }
 
         /// Returns true when the key moved keyboard focus to a DIFFERENT
