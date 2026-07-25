@@ -28,11 +28,15 @@
 //!   extractor (exact for every finite double, the infinities, and the
 //!   canonical quiet NaN), exported as `nsc_core_model_snapshot` plus
 //!   the two scalar probes the parity suite drives;
-//! - the channel bytes envelope, one export per wired channel entry
-//!   (`nsc_core_<channel>`): the entry's whole multi-value result rides
-//!   ONE bytes return — [produced u8][tag u8][payload…] — packed here
-//!   from a produced message or null, so the compile mode's channel
-//!   exports run the author's channel function and forward the result;
+//! - the channel bytes envelope: the wire-shaped channel entries, one
+//!   per wired channel (`nsc_core_<channel>_msg`), whose parameters
+//!   mirror the compiled core's C declarations and whose whole
+//!   multi-value result rides ONE bytes return — [produced u8][tag u8]
+//!   [payload…]. Each builds its event record, runs the channel
+//!   function (a null gate here, the compile mode's author seam, like
+//!   `update` below), and packs the result through the exported packer
+//!   (`nsc_core_pack_msg`), the produced-message-or-null surface hosts
+//!   holding a mirror value use directly;
 //! - the identity constants, the sidecar's unbound-list declarations
 //!   (authors declare nothing; the generator carries them), and
 //!   deterministic zero/sample model builders so a compiled facade can
@@ -93,6 +97,8 @@ const FacadeEmitter = struct {
     diags: *sidecar_mod.Diagnostics,
     out: std.ArrayListUnmanaged(u8),
     inlined: []const []const u8 = &.{},
+    flattened: []const []const u8 = &.{},
+    node_stored: []const []const u8 = &.{},
     sample_ordinal: usize = 0,
     sample_slice_depth: usize = 0,
 
@@ -120,12 +126,15 @@ const FacadeEmitter = struct {
 
     fn run(self: *FacadeEmitter) Error!void {
         self.inlined = try emit_mod.inlinedTableNames(self.arena, self.sidecar);
+        self.flattened = try self.flattenedTableNames();
+        self.node_stored = try self.nodeStoredTableNames();
         try self.validateNames();
         self.validateOptionalDepth();
         if (self.diags.hasErrors()) return;
         try self.header();
         try self.typeMirrors();
         try self.unboundDecl();
+        try self.hostChannelDecls();
         try self.entryPoints();
         try self.constants();
         try self.msgConstructors();
@@ -246,7 +255,39 @@ const FacadeEmitter = struct {
                 self.diags.flag("types", "enum \"{s}\" has one member — a single string literal is not a union in the projected subset, so no source can author it; give the state a second member or fold it away in the core source", .{entry.name});
             }
         }
-        const facade_decls = [_][]const u8{ "initialModel", "update", "viewUnbound", "asciiBytes", "NscfContractError", "NSCF_POW" };
+        var facade_decls: std.ArrayListUnmanaged([]const u8) = .empty;
+        try facade_decls.appendSlice(self.arena, &.{ "initialModel", "update", "asciiBytes", "NscfContractError", "NSCF_POW" });
+        if (self.sidecar.init_returns_cmd or self.sidecar.update_returns_cmd) try facade_decls.append(self.arena, "Cmd");
+        if (self.sidecar.has_subscriptions) try facade_decls.append(self.arena, "Sub");
+        // The unbound consts declare exactly when their lists are
+        // nonempty (unboundDecl), so their names join the fence exactly
+        // then: an unbound MODEL list needs at least one entry naming a
+        // model field (helper entries stay sidecar facts here).
+        const model_struct = sidecar_mod.findStruct(self.sidecar.types, self.sidecar.model).?;
+        const any_field_unbound = blk: {
+            for (self.sidecar.model_unbound) |name| {
+                for (model_struct.fields) |field| {
+                    if (std.mem.eql(u8, field.name, name)) break :blk true;
+                }
+            }
+            break :blk false;
+        };
+        if (any_field_unbound or self.sidecar.msg.unbound.len > 0) try facade_decls.append(self.arena, "viewUnbound");
+        if (any_field_unbound) try facade_decls.append(self.arena, "modelUnbound");
+        if (self.sidecar.msg.unbound.len > 0) try facade_decls.append(self.arena, "msgUnbound");
+        // Wired channels add their event records, the channel-function
+        // null gates, and (pinch) the phase vocabulary to the facade's
+        // own declarations; the host-constructed and environment
+        // channels add their exported-const conventions; a subscribing
+        // contract adds the subscriptions stub.
+        if (self.sidecar.channels.command_msg) try facade_decls.append(self.arena, "commandMsg");
+        if (self.sidecar.channels.frame_msg) try facade_decls.appendSlice(self.arena, &.{ "FrameEvent", "frameMsg" });
+        if (self.sidecar.channels.key_msg) try facade_decls.appendSlice(self.arena, &.{ "KeyEvent", "keyMsg" });
+        if (self.sidecar.channels.pinch_msg) try facade_decls.appendSlice(self.arena, &.{ "PinchPhase", "PinchEvent", "pinchMsg" });
+        if (self.sidecar.channels.appearance_msg != null) try facade_decls.append(self.arena, "appearanceMsg");
+        if (self.sidecar.channels.chrome_msg != null) try facade_decls.append(self.arena, "chromeMsg");
+        if (self.sidecar.channels.env_msgs.len > 0) try facade_decls.append(self.arena, "envMsgs");
+        if (self.sidecar.has_subscriptions) try facade_decls.append(self.arena, "subscriptions");
         // Field names join the fence only for the reserved nsc name
         // space (they may otherwise be anything, quoted if exotic):
         // constructor parameter fallbacks and the runtime prelude own
@@ -272,11 +313,128 @@ const FacadeEmitter = struct {
                 else => {},
             }
         }
-        for (self.sidecar.types.structs) |entry| try self.fenceDecl(entry.name, &facade_decls);
-        for (self.sidecar.types.enums) |entry| try self.fenceDecl(entry.name, &facade_decls);
-        for (self.sidecar.types.unions) |entry| try self.fenceDecl(entry.name, &facade_decls);
-        try self.fenceDecl(self.sidecar.msg.name, &facade_decls);
+        for (self.sidecar.types.structs) |entry| try self.fenceDecl(entry.name, facade_decls.items);
+        for (self.sidecar.types.enums) |entry| try self.fenceDecl(entry.name, facade_decls.items);
+        for (self.sidecar.types.unions) |entry| try self.fenceDecl(entry.name, facade_decls.items);
+        try self.fenceDecl(self.sidecar.msg.name, facade_decls.items);
+
+        // Declaration form spells storage ONCE per record, so a record
+        // referenced both by node and by value has no projection — one
+        // declaration cannot say both. (The transpiled lane decides
+        // storage per TYPE, so its contracts never mix; a hand contract
+        // that does must split the type.)
+        var value_refs: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (self.sidecar.types.structs) |entry| {
+            for (entry.fields) |field| try noteValueRefs(&value_refs, self.arena, field.type);
+        }
+        for (self.sidecar.types.unions) |entry| {
+            for (entry.arms) |arm| try noteValueRefs(&value_refs, self.arena, arm.payload);
+        }
+        for (self.sidecar.model_helpers) |helper| {
+            try noteValueRefs(&value_refs, self.arena, helper.returns);
+            for (helper.params) |param| try noteValueRefs(&value_refs, self.arena, param);
+        }
+        for (self.sidecar.msg.arms) |arm| {
+            switch (arm.payload) {
+                .scalar => |ref| try noteValueRefs(&value_refs, self.arena, ref),
+                else => {},
+            }
+        }
+        for (value_refs.items) |name| {
+            if (nameListed(self.node_stored, name)) {
+                self.diags.flag("types", "\"{s}\" is stored by reference at one site and by value at another — the projection states storage once per declaration, so one record cannot say both; split the type in the core source", .{name});
+            }
+        }
+
+        // Value records the MODEL keeps carry scalar fields only, and
+        // model sequences carry reference-stored records: the facade's
+        // consumers commit by-value records shallowly, so heap-backed
+        // fields would dangle across frames and by-value arrays have no
+        // commit walk. Refuse here, where the teaching can name the
+        // record, instead of emitting a facade its compilers refuse.
+        try self.validateModelValueRecords();
+
+        // The host-constructed channels build their event record's
+        // fields DIRECTLY on the named arm, so the arm's record must
+        // flatten into the arm literal (the single-use synthesized
+        // shape). A shared named record would project as a nested
+        // `value` member no host construction can fill.
+        if (self.sidecar.channels.appearance_msg) |arm_name| {
+            try self.requireFlattenedChannelArm("channels.appearance_msg", arm_name);
+        }
+        if (self.sidecar.channels.chrome_msg) |arm_name| {
+            try self.requireFlattenedChannelArm("channels.chrome_msg", arm_name);
+        }
         if (!std.mem.eql(u8, self.sidecar.model, "Model")) try self.fenceDecl("", &.{}); // placeholder keeps shape symmetric
+    }
+
+    /// Walk the model tree and refuse the value-record shapes the
+    /// facade's compilers cannot carry: a model-kept value record with
+    /// a non-scalar field, and a model sequence of value records.
+    fn validateModelValueRecords(self: *FacadeEmitter) Error!void {
+        var visited: std.ArrayListUnmanaged([]const u8) = .empty;
+        const model = sidecar_mod.findStruct(self.sidecar.types, self.sidecar.model) orelse return;
+        for (model.fields) |field| {
+            try self.visitModelRef(&visited, field.type);
+        }
+    }
+
+    fn visitModelRef(self: *FacadeEmitter, visited: *std.ArrayListUnmanaged([]const u8), ref: TypeRef) Error!void {
+        switch (ref) {
+            .value => |name| {
+                if (nameListed(visited.items, name)) return;
+                try visited.append(self.arena, name);
+                const entry = sidecar_mod.findStruct(self.sidecar.types, name) orelse return;
+                for (entry.fields) |field| {
+                    const scalar = switch (field.type) {
+                        .f64, .i64, .bool, .enum_ref => true,
+                        else => false,
+                    };
+                    if (!scalar) {
+                        self.diags.flag("types", "\"{s}\" is a value-stored record the model keeps, but field \"{s}\" is not a scalar — the compiled projection commits value records shallowly, so heap-backed fields would dangle across frames; store \"{s}\" by reference in the core source", .{ name, field.name, name });
+                        break;
+                    }
+                }
+            },
+            .node => |name| {
+                if (nameListed(visited.items, name)) return;
+                try visited.append(self.arena, name);
+                const entry = sidecar_mod.findStruct(self.sidecar.types, name) orelse return;
+                for (entry.fields) |field| {
+                    try self.visitModelRef(visited, field.type);
+                }
+            },
+            .union_ref => |name| {
+                if (nameListed(visited.items, name)) return;
+                try visited.append(self.arena, name);
+                const entry = sidecar_mod.findUnion(self.sidecar.types, name) orelse return;
+                for (entry.arms) |arm| {
+                    try self.visitModelRef(visited, arm.payload);
+                }
+            },
+            .slice => |elem| {
+                const element = if (elem.* == .optional) elem.optional.* else elem.*;
+                if (element == .value) {
+                    self.diags.flag("types", "a model sequence holds \"{s}\" by value — sequences the model keeps carry reference-stored records (the compiled projection has no by-value sequence commit); store \"{s}\" by reference in the core source", .{ element.value, element.value });
+                }
+                try self.visitModelRef(visited, elem.*);
+            },
+            .optional => |inner| try self.visitModelRef(visited, inner.*),
+            else => {},
+        }
+    }
+
+    /// Refuse a host-constructed channel arm whose record does not
+    /// flatten into its arm literal.
+    fn requireFlattenedChannelArm(self: *FacadeEmitter, at: []const u8, arm_name: []const u8) Error!void {
+        const arm = sidecar_mod.findArm(self.sidecar.msg, arm_name) orelse return;
+        switch (arm.payload) {
+            .record => |name| {
+                if (nameListed(self.flattened, name)) return;
+                self.diags.flag(at, "arm \"{s}\" carries the named record \"{s}\", which the projection cannot flatten into the arm (the host fills the event's fields directly on the arm) — declare the event's fields inline on the arm in the core source", .{ arm_name, name });
+            },
+            else => {},
+        }
     }
 
     fn fenceDecl(self: *FacadeEmitter, name: []const u8, facade_decls: []const []const u8) Error!void {
@@ -345,6 +503,18 @@ const FacadeEmitter = struct {
     // ------------------------------------------------------- sections
 
     fn header(self: *FacadeEmitter) Error!void {
+        // The effect vocabulary joins the import exactly when a
+        // contract shape needs it: Cmd for a cmd-returning entry stub,
+        // Sub for the subscriptions stub.
+        const needs_cmd = self.sidecar.init_returns_cmd or self.sidecar.update_returns_cmd;
+        const imports: []const u8 = if (needs_cmd and self.sidecar.has_subscriptions)
+            "Cmd, Sub, asciiBytes"
+        else if (needs_cmd)
+            "Cmd, asciiBytes"
+        else if (self.sidecar.has_subscriptions)
+            "Sub, asciiBytes"
+        else
+            "asciiBytes";
         try self.print(
             \\// Generated by corewire from this app's core.contract.json — the
             \\// TypeScript projection of the compiled core's contract. The same
@@ -356,9 +526,9 @@ const FacadeEmitter = struct {
             \\// Contract identity: entry {s}, compiler {s}, build_id
             \\// {x:0>16}.
             \\
-            \\import {{ asciiBytes }} from "@native-sdk/core";
+            \\import {{ {s} }} from "@native-sdk/core";
             \\
-        , .{ try commentText(self.arena, self.sidecar.entry), try commentText(self.arena, self.sidecar.compiler_version), self.sidecar.build_id });
+        , .{ try commentText(self.arena, self.sidecar.entry), try commentText(self.arena, self.sidecar.compiler_version), self.sidecar.build_id, imports });
     }
 
     fn typeMirrors(self: *FacadeEmitter) Error!void {
@@ -369,12 +539,14 @@ const FacadeEmitter = struct {
             }
             try self.raw(";\n");
         }
-        // Every table entry gets a NAMED declaration: the subset has no
-        // inline object types, and TypeScript names never reach the
-        // host's reflection surface, so the Zig lane's inline-anonymous
-        // fidelity concern does not exist here.
+        // Every table entry gets a NAMED declaration — except the
+        // flattened single-use records, whose whole shape lives inline
+        // in their one arm literal and whose synthesized names must
+        // stay undeclared (a downstream consumer of the module
+        // re-derives the same names from the inline arms).
         for (self.sidecar.types.structs) |*entry| {
             if (std.mem.eql(u8, entry.name, self.sidecar.model)) continue;
+            if (nameListed(self.flattened, entry.name)) continue;
             try self.structInterface(entry);
         }
         for (self.sidecar.types.unions) |entry| {
@@ -401,11 +573,20 @@ const FacadeEmitter = struct {
     }
 
     fn structInterface(self: *FacadeEmitter, entry: *const sidecar_mod.Struct) Error!void {
-        try self.print("\nexport interface {s} {{", .{self.spellName(entry.name)});
+        // Declaration form spells storage for a contract emitter that
+        // re-derives it: node-stored records (and the model root, whose
+        // designation must be an interface) declare as interfaces;
+        // value-stored records take the object-literal alias form.
+        const as_interface = nameListed(self.node_stored, entry.name) or std.mem.eql(u8, entry.name, self.sidecar.model);
+        if (as_interface) {
+            try self.print("\nexport interface {s} {{", .{self.spellName(entry.name)});
+        } else {
+            try self.print("\nexport type {s} = {{", .{self.spellName(entry.name)});
+        }
         for (entry.fields) |field| {
             try self.print("\n  readonly {s}: {s};", .{ try tsProp(self.arena, field.name), try self.spellRef(field.type, entry.name, field.name) });
         }
-        try self.raw("\n}\n");
+        try self.raw(if (as_interface) "\n}\n" else "\n};\n");
     }
 
     /// One arm of a kind-tagged union type: bare, single `value`
@@ -432,11 +613,78 @@ const FacadeEmitter = struct {
         return std.fmt.allocPrint(self.arena, "{{ readonly kind: \"{s}\"; readonly value: {s} }}", .{ escaped, try self.spellRef(ref, union_name, arm_name) });
     }
 
+    /// The synthesized single-use records this projection flattens into
+    /// their one arm literal: neither an interface declaration nor a
+    /// named encoder ever spells them, so their synthesized names stay
+    /// free for any downstream consumer of the module that re-derives
+    /// the same names from the inline arms.
+    fn flattenedTableNames(self: *FacadeEmitter) Error![]const []const u8 {
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (self.sidecar.msg.arms) |arm| {
+            switch (arm.payload) {
+                .record => {
+                    if (self.synthesizedRecordOf(recordPayloadRef(arm.payload), self.sidecar.msg.name, arm.name)) |record| {
+                        try names.append(self.arena, record.name);
+                    }
+                },
+                else => {},
+            }
+        }
+        for (self.sidecar.types.unions) |entry| {
+            for (entry.arms) |arm| {
+                if (arm.payload == .void) continue;
+                if (self.synthesizedRecordOf(arm.payload, entry.name, arm.name)) |record| {
+                    try names.append(self.arena, record.name);
+                }
+            }
+        }
+        return names.items;
+    }
+
+    /// The record names the contract stores BY REFERENCE anywhere: they
+    /// declare as interfaces (the projection's node-storage spelling);
+    /// every other record declares as an object-literal type alias (the
+    /// value-storage spelling), so a contract emitter re-deriving
+    /// storage from declaration form lands on the contract's own
+    /// classes.
+    fn nodeStoredTableNames(self: *FacadeEmitter) Error![]const []const u8 {
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        // The model root is reference-stored by contract (no explicit
+        // reference spells it), so it seeds the set: a `value`
+        // reference to the root elsewhere is the mixed-storage case and
+        // refuses like any other.
+        try names.append(self.arena, self.sidecar.model);
+        for (self.sidecar.types.structs) |entry| {
+            for (entry.fields) |field| {
+                try noteNodeRefs(&names, self.arena, field.type);
+            }
+        }
+        for (self.sidecar.types.unions) |entry| {
+            for (entry.arms) |arm| {
+                try noteNodeRefs(&names, self.arena, arm.payload);
+            }
+        }
+        for (self.sidecar.model_helpers) |helper| {
+            try noteNodeRefs(&names, self.arena, helper.returns);
+            for (helper.params) |param| try noteNodeRefs(&names, self.arena, param);
+        }
+        for (self.sidecar.msg.arms) |arm| {
+            switch (arm.payload) {
+                .scalar => |ref| try noteNodeRefs(&names, self.arena, ref),
+                else => {},
+            }
+        }
+        return names.items;
+    }
+
     /// The struct behind a synthesized, inlined record reference at
-    /// this site — the shape that flattens beside `kind`.
+    /// this site — the shape that flattens beside `kind`. VALUE
+    /// references only: flattening is a by-value layout, so a
+    /// node-stored payload keeps its named declaration however its
+    /// name is spelled.
     fn synthesizedRecordOf(self: *FacadeEmitter, ref: TypeRef, container: []const u8, member: []const u8) ?*const sidecar_mod.Struct {
         const name = switch (ref) {
-            .node, .value => |n| n,
+            .value => |n| n,
             else => return null,
         };
         if (!emit_mod.isSynthesizedRef(container, member, name) or !nameListed(self.inlined, name)) return null;
@@ -506,13 +754,19 @@ const FacadeEmitter = struct {
             .void => "void",
             .optional => |inner| try std.fmt.allocPrint(self.arena, "{s} | null", .{try self.spellRef(inner.*, container, member)}),
             .slice => |elem| blk: {
+                // Sequences spell plain `T[]`: the declaration site's own
+                // `readonly` modifier already pins immutability, and the
+                // plain spelling is the one the projection's closed type
+                // vocabulary carries end to end (the readonly-array type
+                // operator has no contract projection).
+                //
                 // Composite element spellings parenthesize: `number |
                 // null[]` would type the null as the array.
                 const spelled = try self.spellRef(elem.*, container, member);
                 if (std.mem.indexOfAny(u8, spelled, " |") != null) {
-                    break :blk try std.fmt.allocPrint(self.arena, "readonly ({s})[]", .{spelled});
+                    break :blk try std.fmt.allocPrint(self.arena, "({s})[]", .{spelled});
                 }
-                break :blk try std.fmt.allocPrint(self.arena, "readonly {s}[]", .{spelled});
+                break :blk try std.fmt.allocPrint(self.arena, "{s}[]", .{spelled});
             },
             // Reference storage is a layout fact of the host mirror;
             // TypeScript sees the record value either way.
@@ -560,11 +814,14 @@ const FacadeEmitter = struct {
         if (field_unbound.items.len == 0 and self.sidecar.msg.unbound.len == 0) return;
         try self.raw(
             \\
-            \\// The unbound-list declaration, carried by the generator from the
+            \\// The unbound-list declarations, carried by the generator from the
             \\// author's own markings in the core module: message arms only the
-            \\// host fires and model fields only update logic reads. (This
+            \\// host fires and model fields only update logic reads. Two
+            \\// consumers, two spellings of one fact: the checker tier reads the
+            \\// single name-resolved viewUnbound list; a contract emitter reads
+            \\// the split modelUnbound/msgUnbound pair. (The authoring
             \\// convention's exact wording is provisional pending the authoring
-            \\// spec; the mechanics — one list, generator-carried — are settled.)
+            \\// spec; the mechanics — generator-carried — are settled.)
             \\export const viewUnbound = [
             \\
         );
@@ -577,6 +834,42 @@ const FacadeEmitter = struct {
             try self.print("  \"{s}\",\n", .{try tsString(self.arena, name)});
         }
         try self.raw("] as const;\n");
+        if (field_unbound.items.len > 0) {
+            // Field names only: unbound HELPERS stay a sidecar fact here
+            // too (the facade declares no helper functions to resolve
+            // them against).
+            try self.raw("\nexport const modelUnbound = [\n");
+            for (field_unbound.items) |name| {
+                try self.print("  \"{s}\",\n", .{try tsString(self.arena, name)});
+            }
+            try self.raw("] as const;\n");
+        }
+        if (self.sidecar.msg.unbound.len > 0) {
+            try self.raw("\nexport const msgUnbound = [\n");
+            for (self.sidecar.msg.unbound) |name| {
+                try self.print("  \"{s}\",\n", .{try tsString(self.arena, name)});
+            }
+            try self.raw("] as const;\n");
+        }
+    }
+
+    /// The host-constructed channel arms and the launch-time environment
+    /// channel: exported-const declarations a contract consumer reads,
+    /// restating the sidecar's channels section.
+    fn hostChannelDecls(self: *FacadeEmitter) Error!void {
+        if (self.sidecar.channels.appearance_msg) |arm_name| {
+            try self.print("\n/// The arm the host fills with the structural appearance record.\nexport const appearanceMsg = \"{s}\";\n", .{try tsString(self.arena, arm_name)});
+        }
+        if (self.sidecar.channels.chrome_msg) |arm_name| {
+            try self.print("\n/// The arm the host fills with the structural window-chrome record.\nexport const chromeMsg = \"{s}\";\n", .{try tsString(self.arena, arm_name)});
+        }
+        if (self.sidecar.channels.env_msgs.len > 0) {
+            try self.raw("\n/// The launch-time environment channel: each variable present at\n/// launch dispatches one journaled Msg on its bytes arm.\nexport const envMsgs = [\n");
+            for (self.sidecar.channels.env_msgs) |entry| {
+                try self.print("  {{ env: \"{s}\", msg: \"{s}\" }},\n", .{ try tsString(self.arena, entry.env), try tsString(self.arena, entry.msg) });
+            }
+            try self.raw("] as const;\n");
+        }
     }
 
     fn entryPoints(self: *FacadeEmitter) Error!void {
@@ -584,20 +877,63 @@ const FacadeEmitter = struct {
         // consumer can boot against. The compiled core's real init and
         // update stay with the author's module; the compile mode wires
         // them in (FACADE-GAPS records the subset rules that keep the
-        // forwarders out of this module today).
+        // forwarders out of this module today). The stubs still carry
+        // the CONTRACT's declared shapes — cmd-returning entries return
+        // the [state, effect] tuple and a subscribing contract declares
+        // the subscriptions function — so every shape flag a consumer
+        // derives from these declarations restates the sidecar's.
         var zero = std.ArrayListUnmanaged(u8).empty;
         try self.zeroValue(&zero, .{ .value = self.sidecar.model }, 1, null);
         try self.print(
             \\
-            \\export function initialModel(): Model {{
+            \\function nscfZeroModel(): Model {{
             \\  return {s};
             \\}}
             \\
-            \\export function update(model: Model, msg: Msg): Model {{
-            \\  return model;
-            \\}}
-            \\
         , .{zero.items});
+        if (self.sidecar.init_returns_cmd) {
+            try self.raw(
+                \\
+                \\export function initialModel(): [Model, Cmd<Msg>] {
+                \\  return [nscfZeroModel(), Cmd.none];
+                \\}
+                \\
+            );
+        } else {
+            try self.raw(
+                \\
+                \\export function initialModel(): Model {
+                \\  return nscfZeroModel();
+                \\}
+                \\
+            );
+        }
+        if (self.sidecar.update_returns_cmd) {
+            try self.raw(
+                \\
+                \\export function update(model: Model, msg: Msg): [Model, Cmd<Msg>] {
+                \\  return [model, Cmd.none];
+                \\}
+                \\
+            );
+        } else {
+            try self.raw(
+                \\
+                \\export function update(model: Model, msg: Msg): Model {
+                \\  return model;
+                \\}
+                \\
+            );
+        }
+        if (self.sidecar.has_subscriptions) {
+            try self.raw(
+                \\
+                \\export function subscriptions(model: Model): Sub<Msg> {
+                \\  return Sub.none;
+                \\}
+                \\
+            );
+        }
     }
 
     fn constants(self: *FacadeEmitter) Error!void {
@@ -1068,6 +1404,9 @@ const FacadeEmitter = struct {
         }
 
         for (self.sidecar.types.structs) |*entry| {
+            // Flattened single-use records encode inline at their one
+            // arm site; a named encoder would need the undeclared type.
+            if (nameListed(self.flattened, entry.name)) continue;
             try self.structEncoder(entry);
         }
         for (self.sidecar.types.unions) |*entry| {
@@ -1101,24 +1440,25 @@ const FacadeEmitter = struct {
     /// marshalling shape of its own. Byte 0 is 0 (nothing produced; the
     /// envelope is exactly two bytes) or 1; byte 1 is the produced arm's
     /// declaration-order wire tag (meaningless when nothing was
-    /// produced; this packer emits 0); the payload is the arm's
+    /// produced; the packer emits 0); the payload is the arm's
     /// canonical value encoding — the envelope's tail is byte-identical
-    /// to the canonical union encoding of the produced message. The
-    /// compile mode's channel exports run the author's channel function
-    /// and hand its `Msg | null` result to the wired entry here.
+    /// to the canonical union encoding of the produced message.
+    ///
+    /// Two surfaces ride the envelope here. `nsc_core_pack_msg` is the
+    /// packer: a produced message or null in, envelope bytes out. The
+    /// `nsc_core_<channel>_msg` exports are the WIRE-shaped channel
+    /// entries whose parameters mirror the compiled core's C
+    /// declarations (bytes ride buffer parameters, boolean modifiers
+    /// u8 0-or-1, the pinch phase its declaration-order member index):
+    /// each builds the channel's event record, runs the channel
+    /// function, and hands the produced message to the packer. The
+    /// channel functions are declared as null gates beside them, the
+    /// way `update` above returns its model unchanged — the compile
+    /// mode that owns the behavioral entry points wires the author's
+    /// code in.
     fn channelEntries(self: *FacadeEmitter) Error!void {
         const chan = self.sidecar.channels;
-        const entries = [_]struct { wired: bool, suffix: []const u8 }{
-            .{ .wired = chan.command_msg, .suffix = "command_msg" },
-            .{ .wired = chan.frame_msg, .suffix = "frame_msg" },
-            .{ .wired = chan.key_msg, .suffix = "key_msg" },
-            .{ .wired = chan.pinch_msg, .suffix = "pinch_msg" },
-        };
-        var any_wired = false;
-        for (entries) |entry| {
-            if (entry.wired) any_wired = true;
-        }
-        if (!any_wired) return;
+        if (!(chan.command_msg or chan.frame_msg or chan.key_msg or chan.pinch_msg)) return;
 
         try self.raw(
             \\
@@ -1139,21 +1479,154 @@ const FacadeEmitter = struct {
         }
         try self.raw("  throw { kind: \"nscf_contract\", teaching: asciiBytes(\"a channel produced a message outside the declared union — the value and the contract disagree\") } as NscfContractError;\n}\n");
 
-        for (entries) |entry| {
-            if (!entry.wired) continue;
-            try self.print(
+        try self.raw(
+            \\
+            \\/// The envelope packer: a produced message or null in, envelope
+            \\/// bytes out. The wire-shaped channel entries below hand their
+            \\/// channel function's result here; a host that already holds a
+            \\/// mirror message value packs through this export directly.
+            \\export function nsc_core_pack_msg(msg: Msg | null): Uint8Array {
+            \\  const nscfMsg = msg;
+            \\  if (nscfMsg === null) {
+            \\    const parts: Uint8Array[] = [nscfByte(0), nscfByte(0)];
+            \\    return nscfCat(parts);
+            \\  } else {
+            \\    return nscfMsgEnvelope(nscfMsg);
+            \\  }
+            \\}
+            \\
+        );
+
+        try self.raw(
+            \\
+            \\// The wire-shaped channel entries, one per wired channel. Their
+            \\// parameters mirror the compiled core's C declarations — bytes ride
+            \\// buffer parameters, the boolean modifiers u8 0-or-1, the pinch
+            \\// phase its declaration-order member index — and the whole result
+            \\// returns as the bytes envelope. Each entry builds its channel's
+            \\// event record, runs the channel function, and hands the produced
+            \\// message to the packer. The channel functions beside them are
+            \\// null gates, exactly as update above returns its model unchanged:
+            \\// the compile mode that owns the behavioral entry points wires the
+            \\// author's code in.
+            \\
+        );
+        if (chan.key_msg) {
+            // A modifier byte past 1 is host/core skew, the wire-tag
+            // teaching's sibling — never silently truthy.
+            try self.raw(
                 \\
-                \\export function nsc_core_{s}(msg: Msg | null): Uint8Array {{
-                \\  const nscfMsg = msg;
-                \\  if (nscfMsg === null) {{
-                \\    const parts: Uint8Array[] = [nscfByte(0), nscfByte(0)];
-                \\    return nscfCat(parts);
-                \\  }} else {{
-                \\    return nscfMsgEnvelope(nscfMsg);
-                \\  }}
-                \\}}
+                \\function nscfWireBool(value: number): boolean {
+                \\  if (value === 0) {
+                \\    return false;
+                \\  }
+                \\  if (value === 1) {
+                \\    return true;
+                \\  }
+                \\  throw { kind: "nscf_contract", teaching: asciiBytes("a channel entry's boolean parameter carries a byte past 1 — the host and this core disagree about the contract") } as NscfContractError;
+                \\}
                 \\
-            , .{entry.suffix});
+            );
+        }
+        if (chan.command_msg) {
+            try self.raw(
+                \\
+                \\function commandMsg(name: Uint8Array): Msg | null {
+                \\  return null;
+                \\}
+                \\
+                \\export function nsc_core_command_msg(name: Uint8Array): Uint8Array {
+                \\  return nsc_core_pack_msg(commandMsg(name));
+                \\}
+                \\
+            );
+        }
+        if (chan.frame_msg) {
+            try self.raw(
+                \\
+                \\/// The presented-frame channel's record: canvas points plus the
+                \\/// frame clock in fractional milliseconds.
+                \\export interface FrameEvent {
+                \\  readonly width: number;
+                \\  readonly height: number;
+                \\  readonly timestampMs: number;
+                \\  readonly intervalMs: number;
+                \\}
+                \\
+                \\function frameMsg(model: Model, frame: FrameEvent): Msg | null {
+                \\  return null;
+                \\}
+                \\
+                \\export function nsc_core_frame_msg(width: number, height: number, timestampMs: number, intervalMs: number): Uint8Array {
+                \\  // The committed model is compile-mode state; until that wiring
+                \\  // lands, the gate receives the deterministic zero model (and
+                \\  // produces nothing regardless).
+                \\  return nsc_core_pack_msg(frameMsg(nscfZeroModel(), { width: width, height: height, timestampMs: timestampMs, intervalMs: intervalMs }));
+                \\}
+                \\
+            );
+        }
+        if (chan.key_msg) {
+            try self.raw(
+                \\
+                \\/// The key-fallback channel's record: the lowercased key name
+                \\/// plus the four modifier booleans.
+                \\export interface KeyEvent {
+                \\  readonly key: Uint8Array;
+                \\  readonly shift: boolean;
+                \\  readonly control: boolean;
+                \\  readonly alt: boolean;
+                \\  readonly super: boolean;
+                \\}
+                \\
+                \\function keyMsg(key: KeyEvent): Msg | null {
+                \\  return null;
+                \\}
+                \\
+                \\export function nsc_core_key_msg(key: Uint8Array, shift: number, control: number, alt: number, superMod: number): Uint8Array {
+                \\  return nsc_core_pack_msg(keyMsg({ key: key, shift: nscfWireBool(shift), control: nscfWireBool(control), alt: nscfWireBool(alt), super: nscfWireBool(superMod) }));
+                \\}
+                \\
+            );
+        }
+        if (chan.pinch_msg) {
+            try self.raw(
+                \\
+                \\export type PinchPhase = "begin" | "change" | "end";
+                \\
+                \\/// The pinch channel's record: window/view source identity, the
+                \\/// multiplicative magnification delta, and the view-local anchor.
+                \\export interface PinchEvent {
+                \\  readonly windowId: number;
+                \\  readonly label: Uint8Array;
+                \\  readonly phase: PinchPhase;
+                \\  readonly scale: number;
+                \\  readonly x: number;
+                \\  readonly y: number;
+                \\}
+                \\
+                \\function nscfPinchPhase(phase: number): PinchPhase {
+                \\  if (phase === 0) {
+                \\    return "begin";
+                \\  }
+                \\  if (phase === 1) {
+                \\    return "change";
+                \\  }
+                \\  if (phase === 2) {
+                \\    return "end";
+                \\  }
+                \\  throw { kind: "nscf_contract", teaching: asciiBytes("a pinch phase index past the declared members reached this core — the host and this core disagree about the contract") } as NscfContractError;
+                \\}
+                \\
+                \\function pinchMsg(pinch: PinchEvent): Msg | null {
+                \\  return null;
+                \\}
+                \\
+                \\export function nsc_core_pinch_msg(windowId: number, label: Uint8Array, phase: number, scale: number, x: number, y: number): Uint8Array {
+                \\  return nsc_core_pack_msg(pinchMsg({ windowId: windowId, label: label, phase: nscfPinchPhase(phase), scale: scale, x: x, y: y }));
+                \\}
+                \\
+            );
         }
     }
 
@@ -1254,6 +1727,32 @@ const FacadeEmitter = struct {
         }
     }
 };
+
+/// Collect the record names `ref` reaches through NODE references,
+/// walking the optional/slice wrappers (a node behind an optional or a
+/// sequence is node storage all the same).
+fn noteNodeRefs(names: *std.ArrayListUnmanaged([]const u8), arena: std.mem.Allocator, ref: TypeRef) error{OutOfMemory}!void {
+    switch (ref) {
+        .node => |name| {
+            if (!nameListed(names.items, name)) try names.append(arena, name);
+        },
+        .optional => |inner| try noteNodeRefs(names, arena, inner.*),
+        .slice => |elem| try noteNodeRefs(names, arena, elem.*),
+        else => {},
+    }
+}
+
+/// The VALUE-reference twin of noteNodeRefs.
+fn noteValueRefs(names: *std.ArrayListUnmanaged([]const u8), arena: std.mem.Allocator, ref: TypeRef) error{OutOfMemory}!void {
+    switch (ref) {
+        .value => |name| {
+            if (!nameListed(names.items, name)) try names.append(arena, name);
+        },
+        .optional => |inner| try noteValueRefs(names, arena, inner.*),
+        .slice => |elem| try noteValueRefs(names, arena, elem.*),
+        else => {},
+    }
+}
 
 /// A msg record payload as the TypeRef shape synthesizedRecordOf reads.
 fn recordPayloadRef(payload: sidecar_mod.Payload) TypeRef {
@@ -1480,24 +1979,76 @@ test "facade emission is deterministic and carries the projection surface" {
     try testing.expect(std.mem.indexOf(u8, first, "export const viewUnbound = [\n  \"label_set\",\n] as const;") != null);
 }
 
-test "wired channels emit envelope-packing exports" {
+test "wired channels emit wire-shaped exports and the packer" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var source = try std.mem.replaceOwned(u8, arena, sidecar_mod.minimal_valid_json, "\"key_msg\": false", "\"key_msg\": true");
     source = try std.mem.replaceOwned(u8, arena, source, "\"helper_call\"]", "\"helper_call\", \"key_msg\"]");
     const generated = try facadeFromJson(arena, source);
-    // One export per wired channel, none for the unwired rest.
-    try testing.expect(std.mem.indexOf(u8, generated, "export function nsc_core_key_msg(msg: Msg | null): Uint8Array {") != null);
+    // The wired channel gets the wire-shaped export (host-event params
+    // in, envelope bytes out), none for the unwired rest.
+    try testing.expect(std.mem.indexOf(u8, generated, "export function nsc_core_key_msg(key: Uint8Array, shift: number, control: number, alt: number, superMod: number): Uint8Array {") != null);
     try testing.expect(std.mem.indexOf(u8, generated, "nsc_core_frame_msg") == null);
     try testing.expect(std.mem.indexOf(u8, generated, "nsc_core_command_msg") == null);
     try testing.expect(std.mem.indexOf(u8, generated, "nsc_core_pinch_msg") == null);
+    // The wire entry runs the channel-function gate and hands the
+    // result to the packer; the modifier bytes convert 0-or-1 strictly.
+    try testing.expect(std.mem.indexOf(u8, generated, "return nsc_core_pack_msg(keyMsg({ key: key, shift: nscfWireBool(shift), control: nscfWireBool(control), alt: nscfWireBool(alt), super: nscfWireBool(superMod) }));") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "function keyMsg(key: KeyEvent): Msg | null {") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "boolean parameter carries a byte past 1") != null);
+    // The packer owns the produced-or-null surface under its own name.
+    try testing.expect(std.mem.indexOf(u8, generated, "export function nsc_core_pack_msg(msg: Msg | null): Uint8Array {") != null);
     // The nothing-produced envelope is exactly [0, 0]; a produced arm
     // leads with [1, tag] and appends the arm's canonical payload.
     try testing.expect(std.mem.indexOf(u8, generated, "const parts: Uint8Array[] = [nscfByte(0), nscfByte(0)];") != null);
     try testing.expect(std.mem.indexOf(u8, generated, "function nscfMsgEnvelope(value: Msg): Uint8Array {") != null);
     try testing.expect(std.mem.indexOf(u8, generated, "if (value.kind === \"bump\") {\n    const parts: Uint8Array[] = [nscfByte(1), nscfByte(0)];\n    return nscfCat(parts);\n  }") != null);
     try testing.expect(std.mem.indexOf(u8, generated, "if (value.kind === \"label_set\") {\n    const parts: Uint8Array[] = [nscfByte(1), nscfByte(1)];\n    parts[parts.length] = nscfBytes(value.value);\n    return nscfCat(parts);\n  }") != null);
+}
+
+test "the command and pinch wire entries marshal their C parameter shapes" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var source = try std.mem.replaceOwned(u8, arena, sidecar_mod.minimal_valid_json, "\"command_msg\": false", "\"command_msg\": true");
+    source = try std.mem.replaceOwned(u8, arena, source, "\"pinch_msg\": false", "\"pinch_msg\": true");
+    source = try std.mem.replaceOwned(u8, arena, source, "\"helper_call\"]", "\"helper_call\", \"command_msg\", \"pinch_msg\"]");
+    const generated = try facadeFromJson(arena, source);
+    try testing.expect(std.mem.indexOf(u8, generated, "export function nsc_core_command_msg(name: Uint8Array): Uint8Array {") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "return nsc_core_pack_msg(commandMsg(name));") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "export function nsc_core_pinch_msg(windowId: number, label: Uint8Array, phase: number, scale: number, x: number, y: number): Uint8Array {") != null);
+    // The phase index maps to the declaration-order member and refuses
+    // past the declared members.
+    try testing.expect(std.mem.indexOf(u8, generated, "return nsc_core_pack_msg(pinchMsg({ windowId: windowId, label: label, phase: nscfPinchPhase(phase), scale: scale, x: x, y: y }));") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "export type PinchPhase = \"begin\" | \"change\" | \"end\";") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "pinch phase index past the declared members") != null);
+    // No key channel: the modifier converter stays out.
+    try testing.expect(std.mem.indexOf(u8, generated, "nscfWireBool") == null);
+}
+
+test "a type taking a wired channel's facade declaration refuses" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var source = try std.mem.replaceOwned(u8, arena, sidecar_mod.minimal_valid_json, "\"key_msg\": false", "\"key_msg\": true");
+    source = try std.mem.replaceOwned(u8, arena, source, "\"helper_call\"]", "\"helper_call\", \"key_msg\"]");
+    source = try std.mem.replaceOwned(u8, arena, source, "\"enums\": []", "\"enums\": [{\"name\": \"KeyEvent\", \"members\": [\"a\", \"b\"]}]");
+    source = try std.mem.replaceOwned(
+        u8,
+        arena,
+        source,
+        "{\"name\": \"label\", \"type\": {\"kind\": \"bytes\"}}",
+        "{\"name\": \"label\", \"type\": {\"kind\": \"enum\", \"name\": \"KeyEvent\"}}",
+    );
+    var diags = sidecar_mod.Diagnostics{ .arena = arena };
+    const parsed = try sidecar_mod.read(arena, source, &diags);
+    try testing.expectError(error.Refused, emitFacade(arena, parsed, &diags));
+    var found = false;
+    for (diags.list.items) |item| {
+        if (item.severity == .@"error" and std.mem.indexOf(u8, item.message, "collides with a declaration the generated facade itself must make") != null) found = true;
+    }
+    try testing.expect(found);
 }
 
 test "unwired channels leave the envelope surface out of the facade" {
@@ -1507,6 +2058,7 @@ test "unwired channels leave the envelope surface out of the facade" {
     const generated = try facadeFromJson(arena, sidecar_mod.minimal_valid_json);
     try testing.expect(std.mem.indexOf(u8, generated, "nscfMsgEnvelope") == null);
     try testing.expect(std.mem.indexOf(u8, generated, "nsc_core_key_msg") == null);
+    try testing.expect(std.mem.indexOf(u8, generated, "nsc_core_pack_msg") == null);
 }
 
 test "envelope payloads follow the sidecar's classes and flattened orders" {
@@ -1533,7 +2085,7 @@ test "envelope payloads follow the sidecar's classes and flattened orders" {
     // The flattened record encodes its fields off the narrowed arm in
     // declaration order, exactly as the arm's mirror payload decodes.
     try testing.expect(std.mem.indexOf(u8, generated, "if (value.kind === \"loaded\") {\n    const parts: Uint8Array[] = [nscfByte(1), nscfByte(1)];\n    parts[parts.length] = nscfF64(value.status);\n    parts[parts.length] = nscfByte(value.ok ? 1 : 0);\n    return nscfCat(parts);\n  }") != null);
-    try testing.expect(std.mem.indexOf(u8, generated, "export function nsc_core_frame_msg(msg: Msg | null): Uint8Array {") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "export function nsc_core_frame_msg(width: number, height: number, timestampMs: number, intervalMs: number): Uint8Array {") != null);
 }
 
 test "u64-attested slots pick the unsigned encoder; the twin emits only when attested" {
@@ -1579,6 +2131,76 @@ test "u64-attested slots pick the unsigned encoder; the twin emits only when att
     try testing.expect(std.mem.indexOf(u8, signed_only, "nscfU64") == null);
 }
 
+test "a synthesized-name node payload keeps its named declaration" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Single-use and pattern-named, but NODE-stored: flattening would
+    // silently convert reference storage to value storage, so the arm
+    // keeps the named payload behind a `value` member and the interface
+    // declares.
+    var source = try std.mem.replaceOwned(u8, arena, sidecar_mod.minimal_valid_json, "\"structs\": [", "\"structs\": [\n      {\"name\": \"Edit_set\", \"fields\": [{\"name\": \"a\", \"type\": {\"kind\": \"f64\"}}, {\"name\": \"b\", \"type\": {\"kind\": \"bool\"}}]},");
+    source = try std.mem.replaceOwned(u8, arena, source, "\"unions\": []", "\"unions\": [{\"name\": \"Edit\", \"arms\": [{\"name\": \"clear\", \"payload\": {\"kind\": \"void\"}}, {\"name\": \"set\", \"payload\": {\"kind\": \"node\", \"name\": \"Edit_set\"}}]}]");
+    source = try std.mem.replaceOwned(
+        u8,
+        arena,
+        source,
+        "{\"name\": \"bump\", \"payload\": {\"kind\": \"void\"}}",
+        "{\"name\": \"bump\", \"payload\": {\"kind\": \"union\", \"name\": \"Edit\"}}",
+    );
+    const generated = try facadeFromJson(arena, source);
+    try testing.expect(std.mem.indexOf(u8, generated, "export interface Edit_set {") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "| { readonly kind: \"set\"; readonly value: Edit_set }") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "readonly kind: \"set\"; readonly a:") == null);
+}
+
+test "a value reference to the model root refuses as mixed storage" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The root is reference-stored by contract; a record field holding
+    // it by value would make the compiled projection re-derive the
+    // field as node storage.
+    var source = try std.mem.replaceOwned(u8, arena, sidecar_mod.minimal_valid_json, "\"structs\": [", "\"structs\": [\n      {\"name\": \"Wrap\", \"fields\": [{\"name\": \"inner\", \"type\": {\"kind\": \"value\", \"name\": \"Model\"}}]},");
+    source = try std.mem.replaceOwned(
+        u8,
+        arena,
+        source,
+        "{\"name\": \"bump\", \"payload\": {\"kind\": \"void\"}}",
+        "{\"name\": \"bump\", \"payload\": {\"kind\": \"record\", \"name\": \"Wrap\"}}",
+    );
+    var diags = sidecar_mod.Diagnostics{ .arena = arena };
+    const parsed = try sidecar_mod.read(arena, source, &diags);
+    try testing.expectError(error.Refused, emitFacade(arena, parsed, &diags));
+    var found = false;
+    for (diags.list.items) |item| {
+        if (item.severity == .@"error" and std.mem.indexOf(u8, item.message, "storage once per declaration") != null) found = true;
+    }
+    try testing.expect(found);
+}
+
+
+test "declaration forms spell the contract's record storage" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A node-stored list element and a value-stored record field: the
+    // former declares as an interface, the latter as an object alias;
+    // the model root stays an interface (its designation requires one).
+    var source = try std.mem.replaceOwned(u8, arena, sidecar_mod.minimal_valid_json, "\"structs\": [", "\"structs\": [\n      {\"name\": \"Task\", \"fields\": [{\"name\": \"id\", \"type\": {\"kind\": \"f64\"}}]},\n      {\"name\": \"Pos\", \"fields\": [{\"name\": \"x\", \"type\": {\"kind\": \"f64\"}}]},");
+    source = try std.mem.replaceOwned(
+        u8,
+        arena,
+        source,
+        "{\"name\": \"label\", \"type\": {\"kind\": \"bytes\"}}",
+        "{\"name\": \"items\", \"type\": {\"kind\": \"slice\", \"elem\": {\"kind\": \"node\", \"name\": \"Task\"}}}, {\"name\": \"pos\", \"type\": {\"kind\": \"value\", \"name\": \"Pos\"}}",
+    );
+    const generated = try facadeFromJson(arena, source);
+    try testing.expect(std.mem.indexOf(u8, generated, "export interface Task {") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "export type Pos = {") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "export interface Model {") != null);
+}
+
 test "composite slice elements parenthesize in the projection" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -1591,7 +2213,7 @@ test "composite slice elements parenthesize in the projection" {
         "{\"name\": \"label\", \"type\": {\"kind\": \"slice\", \"elem\": {\"kind\": \"optional\", \"inner\": {\"kind\": \"f64\"}}}}",
     );
     const generated = try facadeFromJson(arena, source);
-    try testing.expect(std.mem.indexOf(u8, generated, "readonly label: readonly (number | null)[];") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "readonly label: (number | null)[];") != null);
 }
 
 test "renamed roots declare under the profile's designated spellings" {
@@ -1609,6 +2231,161 @@ test "renamed roots declare under the profile's designated spellings" {
     try testing.expect(std.mem.indexOf(u8, generated, "export type Msg =") != null);
     try testing.expect(std.mem.indexOf(u8, generated, "export type Event = Msg;") != null);
     try testing.expect(std.mem.indexOf(u8, generated, "export function initialModel(): Model {") != null);
+}
+
+test "entry stubs carry the contract's declared shapes" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // minimal_valid_json: init bare, update cmd-returning, no
+    // subscriptions.
+    const generated = try facadeFromJson(arena, sidecar_mod.minimal_valid_json);
+    try testing.expect(std.mem.indexOf(u8, generated, "export function initialModel(): Model {") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "export function update(model: Model, msg: Msg): [Model, Cmd<Msg>] {") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "return [model, Cmd.none];") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "import { Cmd, asciiBytes }") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "subscriptions") == null);
+
+    // The inverse shapes: cmd-returning init, bare update, a
+    // subscribing contract.
+    var source = try std.mem.replaceOwned(u8, arena, sidecar_mod.minimal_valid_json, "\"init_returns_cmd\": false", "\"init_returns_cmd\": true");
+    source = try std.mem.replaceOwned(u8, arena, source, "\"update_returns_cmd\": true", "\"update_returns_cmd\": false");
+    source = try std.mem.replaceOwned(u8, arena, source, "\"has_subscriptions\": false", "\"has_subscriptions\": true");
+    const inverse = try facadeFromJson(arena, source);
+    try testing.expect(std.mem.indexOf(u8, inverse, "export function initialModel(): [Model, Cmd<Msg>] {") != null);
+    try testing.expect(std.mem.indexOf(u8, inverse, "return [nscfZeroModel(), Cmd.none];") != null);
+    try testing.expect(std.mem.indexOf(u8, inverse, "export function update(model: Model, msg: Msg): Model {") != null);
+    try testing.expect(std.mem.indexOf(u8, inverse, "export function subscriptions(model: Model): Sub<Msg> {") != null);
+    try testing.expect(std.mem.indexOf(u8, inverse, "import { Cmd, Sub, asciiBytes }") != null);
+}
+
+test "split unbound consts and host-channel consts restate the sidecar" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var source = try std.mem.replaceOwned(u8, arena, sidecar_mod.minimal_valid_json, "\"model_unbound\": []", "\"model_unbound\": [\"count\"]");
+    source = try std.mem.replaceOwned(
+        u8,
+        arena,
+        source,
+        "\"env_msgs\": []",
+        "\"env_msgs\": [{\"env\": \"APP_LABEL\", \"msg\": \"label_set\"}]",
+    );
+    const generated = try facadeFromJson(arena, source);
+    // One fact, two spellings: the checker tier's single list plus the
+    // contract emitter's split pair.
+    try testing.expect(std.mem.indexOf(u8, generated, "export const viewUnbound = [\n  \"label_set\",\n  \"count\",\n] as const;") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "export const modelUnbound = [\n  \"count\",\n] as const;") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "export const msgUnbound = [\n  \"label_set\",\n] as const;") != null);
+    // The environment channel's exported-const convention.
+    try testing.expect(std.mem.indexOf(u8, generated, "export const envMsgs = [\n  { env: \"APP_LABEL\", msg: \"label_set\" },\n] as const;") != null);
+    // No host-constructed arms declared: the consts stay out.
+    try testing.expect(std.mem.indexOf(u8, generated, "appearanceMsg") == null);
+    try testing.expect(std.mem.indexOf(u8, generated, "chromeMsg") == null);
+}
+
+test "a record referenced by node and value at once refuses" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var source = try std.mem.replaceOwned(u8, arena, sidecar_mod.minimal_valid_json, "\"structs\": [", "\"structs\": [\n      {\"name\": \"Item\", \"fields\": [{\"name\": \"x\", \"type\": {\"kind\": \"f64\"}}]},");
+    source = try std.mem.replaceOwned(
+        u8,
+        arena,
+        source,
+        "{\"name\": \"label\", \"type\": {\"kind\": \"bytes\"}}",
+        "{\"name\": \"live\", \"type\": {\"kind\": \"node\", \"name\": \"Item\"}}, {\"name\": \"cached\", \"type\": {\"kind\": \"value\", \"name\": \"Item\"}}",
+    );
+    var diags = sidecar_mod.Diagnostics{ .arena = arena };
+    const parsed = try sidecar_mod.read(arena, source, &diags);
+    try testing.expectError(error.Refused, emitFacade(arena, parsed, &diags));
+    var found = false;
+    for (diags.list.items) |item| {
+        if (item.severity == .@"error" and std.mem.indexOf(u8, item.message, "storage once per declaration") != null) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "a host-constructed channel arm with a shared named record refuses" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // AppearanceEvent is used TWICE (a model field and the arm), so it
+    // never flattens; the host cannot fill its fields directly on the
+    // arm.
+    var source = try std.mem.replaceOwned(u8, arena, sidecar_mod.minimal_valid_json, "\"structs\": [", "\"structs\": [\n      {\"name\": \"AppearanceEvent\", \"fields\": [{\"name\": \"colorScheme\", \"type\": {\"kind\": \"enum\", \"name\": \"ColorScheme\"}}, {\"name\": \"reduceMotion\", \"type\": {\"kind\": \"bool\"}}, {\"name\": \"highContrast\", \"type\": {\"kind\": \"bool\"}}]},");
+    source = try std.mem.replaceOwned(u8, arena, source, "\"enums\": []", "\"enums\": [{\"name\": \"ColorScheme\", \"members\": [\"light\", \"dark\"]}]");
+    source = try std.mem.replaceOwned(
+        u8,
+        arena,
+        source,
+        "{\"name\": \"label\", \"type\": {\"kind\": \"bytes\"}}",
+        "{\"name\": \"last\", \"type\": {\"kind\": \"value\", \"name\": \"AppearanceEvent\"}}",
+    );
+    source = try std.mem.replaceOwned(
+        u8,
+        arena,
+        source,
+        "{\"name\": \"bump\", \"payload\": {\"kind\": \"void\"}}",
+        "{\"name\": \"appearance_changed\", \"payload\": {\"kind\": \"record\", \"name\": \"AppearanceEvent\"}}",
+    );
+    source = try std.mem.replaceOwned(u8, arena, source, "\"appearance_msg\": null", "\"appearance_msg\": \"appearance_changed\"");
+    var diags = sidecar_mod.Diagnostics{ .arena = arena };
+    const parsed = try sidecar_mod.read(arena, source, &diags);
+    try testing.expectError(error.Refused, emitFacade(arena, parsed, &diags));
+    var found = false;
+    for (diags.list.items) |item| {
+        if (item.severity == .@"error" and std.mem.indexOf(u8, item.message, "cannot flatten into the arm") != null) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "viewUnbound is fenced only when the const declares" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // No unbound facts at all: a contract type named viewUnbound
+    // projects (nothing collides).
+    var source = try std.mem.replaceOwned(u8, arena, sidecar_mod.minimal_valid_json, "\"unbound\": [\"label_set\"]", "\"unbound\": []");
+    source = try std.mem.replaceOwned(u8, arena, source, "\"enums\": []", "\"enums\": [{\"name\": \"viewUnbound\", \"members\": [\"a\", \"b\"]}]");
+    source = try std.mem.replaceOwned(
+        u8,
+        arena,
+        source,
+        "{\"name\": \"label\", \"type\": {\"kind\": \"bytes\"}}",
+        "{\"name\": \"label\", \"type\": {\"kind\": \"enum\", \"name\": \"viewUnbound\"}}",
+    );
+    const generated = try facadeFromJson(arena, source);
+    try testing.expect(std.mem.indexOf(u8, generated, "export type viewUnbound =") != null);
+    // With an unbound arm, the const declares and the name refuses.
+    const colliding = try std.mem.replaceOwned(u8, arena, source, "\"unbound\": []", "\"unbound\": [\"label_set\"]");
+    var diags = sidecar_mod.Diagnostics{ .arena = arena };
+    const parsed = try sidecar_mod.read(arena, colliding, &diags);
+    try testing.expectError(error.Refused, emitFacade(arena, parsed, &diags));
+}
+
+test "the split unbound names are fenced only when their consts declare" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A contract type named modelUnbound projects while no unbound
+    // model fields exist: nothing collides, nothing refuses.
+    var source = try std.mem.replaceOwned(u8, arena, sidecar_mod.minimal_valid_json, "\"enums\": []", "\"enums\": [{\"name\": \"modelUnbound\", \"members\": [\"a\", \"b\"]}]");
+    source = try std.mem.replaceOwned(
+        u8,
+        arena,
+        source,
+        "{\"name\": \"label\", \"type\": {\"kind\": \"bytes\"}}",
+        "{\"name\": \"label\", \"type\": {\"kind\": \"enum\", \"name\": \"modelUnbound\"}}",
+    );
+    const generated = try facadeFromJson(arena, source);
+    try testing.expect(std.mem.indexOf(u8, generated, "export type modelUnbound =") != null);
+    // The same type refuses once an unbound model field makes the
+    // facade declare the const.
+    const colliding = try std.mem.replaceOwned(u8, arena, source, "\"model_unbound\": []", "\"model_unbound\": [\"count\"]");
+    var diags = sidecar_mod.Diagnostics{ .arena = arena };
+    const parsed = try sidecar_mod.read(arena, colliding, &diags);
+    try testing.expectError(error.Refused, emitFacade(arena, parsed, &diags));
 }
 
 test "unbound helper names stay out of the facade's viewUnbound list" {

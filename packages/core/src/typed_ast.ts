@@ -234,11 +234,20 @@ export class TypedAst {
 
   /// Union members of a discriminated union type node, with the discriminant
   /// literal of each member for the given tag property. Returns null when the
-  /// node is not a union of object types each carrying a literal tag.
+  /// node is not a union of object types each carrying a literal tag. A bare
+  /// object literal whose tag property is a string LITERAL type is the
+  /// singleton case of the same shape (`type Msg = { kind: "inc" }` is a
+  /// one-arm tagged union, never a record holding a textual `kind`).
   discriminatedUnionMembers(node: tsImpl.TypeNode, tagName: string): UnionMemberInfo[] | null {
-    if (!tsImpl.isUnionTypeNode(node)) return null;
+    const singleton = !tsImpl.isUnionTypeNode(node);
+    const memberNodes: readonly tsImpl.TypeNode[] = tsImpl.isUnionTypeNode(node)
+      ? node.types
+      : tsImpl.isTypeLiteralNode(node)
+        ? [node]
+        : [];
+    if (memberNodes.length === 0) return null;
     const members: UnionMemberInfo[] = [];
-    for (const member of node.types) {
+    for (const member of memberNodes) {
       if (!tsImpl.isTypeLiteralNode(member)) return null;
       let tag: string | null = null;
       const fields: PropInfo[] = [];
@@ -246,16 +255,32 @@ export class TypedAst {
         if (!tsImpl.isPropertySignature(prop) || !prop.name || !tsImpl.isIdentifier(prop.name)) return null;
         const name = prop.name.text;
         if (name === tagName) {
+          // An optional tag is no discriminant: the source permits the
+          // untagged value while the projected union would demand the
+          // arm, so the shape is not this one.
+          if (prop.questionToken) return null;
           if (!prop.type) return null;
+          // The SINGLETON case claims the union reading only for a
+          // syntactic literal tag (`kind: "inc"`): a record whose
+          // `kind` field merely RESOLVES to one literal (an aliased
+          // member type) is a record with a tag-named field, not a
+          // one-arm union.
+          if (singleton && !(tsImpl.isLiteralTypeNode(prop.type) && tsImpl.isStringLiteral(prop.type.literal))) {
+            return null;
+          }
           const t = this.checker.getTypeFromTypeNode(prop.type);
           const value = this.literalValue(t);
           if (typeof value !== "string") return null;
           tag = value;
           continue;
         }
+        // An optional payload property has no native slot: the source
+        // permits the absent member while the emitted arm would demand
+        // it, so the shape is not this one (spell absence as `| null`).
+        if (prop.questionToken) return null;
         fields.push({
           name,
-          optional: prop.questionToken !== undefined,
+          optional: false,
           readonly: hasReadonlyModifier(prop),
           typeNode: prop.type,
           declaration: prop,
@@ -298,6 +323,28 @@ export class TypedAst {
       out.push({
         name: member.name.text,
         optional: member.questionToken !== undefined,
+        readonly: hasReadonlyModifier(member),
+        typeNode: member.type,
+        declaration: member,
+      });
+    }
+    return out;
+  }
+
+  /// Properties of an object-literal type alias body, in declaration
+  /// order — null unless every member is a plain record property (an
+  /// identifier-named, annotated, non-optional property signature), so
+  /// a shape this walk cannot carry whole refuses as an unsupported
+  /// alias instead of registering a struct with silently missing
+  /// fields.
+  propsOfTypeLiteral(node: tsImpl.TypeLiteralNode): PropInfo[] | null {
+    const out: PropInfo[] = [];
+    for (const member of node.members) {
+      if (!tsImpl.isPropertySignature(member) || !member.name || !tsImpl.isIdentifier(member.name)) return null;
+      if (member.questionToken || !member.type) return null;
+      out.push({
+        name: member.name.text,
+        optional: false,
         readonly: hasReadonlyModifier(member),
         typeNode: member.type,
         declaration: member,

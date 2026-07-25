@@ -465,6 +465,8 @@ export class SubsetChecker {
     this.checkSubPurity();
     this.checkModelBindingSurface();
     this.checkViewUnbound();
+    this.checkReservedContractConsts();
+    this.checkValueRecordAliases();
     for (const file of this.files) this.walk(file);
     this.checkExceptions();
     return {
@@ -694,6 +696,300 @@ export class SubsetChecker {
     }
   }
 
+  /// The unbound-list consts (viewUnbound and the split
+  /// modelUnbound/msgUnbound pair) are contract vocabulary the build
+  /// reads and never emits, so a reference to one in program code would
+  /// name a declaration the generated module does not carry. Refuse the
+  /// reference where it stands instead of shipping an unresolved
+  /// identifier.
+  private checkReservedContractConsts(): void {
+    const reserved = new Set(["viewUnbound", "modelUnbound", "msgUnbound"]);
+    const declaresReserved = (decl: ts.Declaration | undefined): decl is ts.VariableDeclaration =>
+      decl !== undefined &&
+      ts.isVariableDeclaration(decl) &&
+      ts.isIdentifier(decl.name) &&
+      reserved.has(decl.name.text) &&
+      ts.isVariableDeclarationList(decl.parent) &&
+      ts.isVariableStatement(decl.parent.parent) &&
+      ts.isSourceFile(decl.parent.parent.parent);
+    const reportReserved = (decl: ts.VariableDeclaration, at: ts.Node): void => {
+      this.report(
+        "NS1032",
+        `\`${(decl.name as ts.Identifier).text}\` is the contract's unbound-list vocabulary the build reads without emitting — it cannot be referenced as module data; rename the constant to use it as data.`,
+        at,
+      );
+    };
+    // The lists are entry-module configuration: a declaration in an
+    // imported module is inert whether exported or not (the build reads
+    // the entry's declarations only), so it refuses like the exported
+    // form instead of silently configuring nothing.
+    for (const file of this.files) {
+      if (file === this.entry) continue;
+      for (const stmt of file.statements) {
+        if (!ts.isVariableStatement(stmt)) continue;
+        for (const decl of stmt.declarationList.declarations) {
+          if (ts.isIdentifier(decl.name) && reserved.has(decl.name.text)) {
+            this.report("NS1014", `\`${decl.name.text}\` is declared in an imported module.`, decl.name);
+          }
+        }
+      }
+    }
+    for (const file of this.files) {
+      const visit = (node: ts.Node): void => {
+        // The value side of a shorthand (`{ modelUnbound }`) reads the
+        // binding through the property symbol; resolve it explicitly.
+        if (ts.isShorthandPropertyAssignment(node)) {
+          const decl = this.tast.shorthandValueDeclaration(node);
+          if (declaresReserved(decl)) reportReserved(decl, node);
+        } else if (
+          ts.isIdentifier(node) &&
+          !(ts.isVariableDeclaration(node.parent) && node.parent.name === node) &&
+          !(ts.isPropertyAccessExpression(node.parent) && node.parent.name === node) &&
+          !(ts.isPropertyAssignment(node.parent) && node.parent.name === node) &&
+          !ts.isPropertySignature(node.parent) &&
+          !(ts.isExportSpecifier(node.parent) || ts.isImportSpecifier(node.parent)) &&
+          !ts.isShorthandPropertyAssignment(node.parent)
+        ) {
+          // Resolve through import aliases so a renamed binding
+          // (`import { modelUnbound as names }`) is caught by what it
+          // DECLARES, never by its spelling.
+          const decl = this.tast.declarationOf(node);
+          if (declaresReserved(decl)) reportReserved(decl, node);
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(file);
+    }
+  }
+
+  /// Object-literal aliases pin VALUE storage (the contract projection's
+  /// value-record spelling), which the model's commit machinery carries
+  /// only for scalar-shallow records — so the shapes value storage
+  /// cannot honor refuse HERE with the teaching, never downstream as an
+  /// internal emit failure or a silent dangling slice:
+  /// the model root itself (the commit walkers need the reference
+  /// root), model-kept aliases with heap-backed fields, model arrays of
+  /// alias records (no by-value slice commit walk), identity comparison
+  /// over value records, and alias self-reference (no finite by-value
+  /// layout).
+  private checkValueRecordAliases(): void {
+    const aliasStruct = (name: string): ts.TypeAliasDeclaration | null => {
+      const info = this.table.structs.get(name);
+      return info && ts.isTypeAliasDeclaration(info.decl) ? info.decl : null;
+    };
+
+    const modelAlias = aliasStruct("Model");
+    if (modelAlias) {
+      this.report("NS1061", "`Model` is declared as an object-literal alias — the model root is reference storage by contract; declare it as an interface.", modelAlias.name);
+    }
+
+    // The entry roots keep their contract shapes whatever declaration
+    // form produced them: a `Model` that classified as anything but a
+    // record (a singleton tagged alias becomes a union, for one) has no
+    // commit path, and a `Msg` that classified as anything but a
+    // kind-tagged union (a plain object alias or an interface becomes a
+    // struct) has no dispatch path.
+    for (const file of this.files) {
+      for (const stmt of file.statements) {
+        if (!ts.isInterfaceDeclaration(stmt) && !ts.isTypeAliasDeclaration(stmt) && !(ts.isClassDeclaration(stmt) && stmt.name)) continue;
+        const rootName = stmt.name!.text;
+        if (rootName === "Model" && (ts.isClassDeclaration(stmt) || !this.table.structs.has("Model"))) {
+          this.report("NS1062", "`Model` does not declare a record — the model root is a reference-stored record; declare it as an interface.", stmt.name!);
+        }
+        if (rootName === "Msg" && !this.table.unions.has("Msg")) {
+          this.report("NS1062", "`Msg` does not declare a kind-tagged union — dispatch routes by the declaration-order kind tags; declare it as a union of `{ kind: \"...\" }` arms.", stmt.name!);
+        }
+      }
+    }
+
+    // The model-reachable record set, walked over the type table.
+    const reachable = new Set<string>();
+    const visit = (t: import("./types.ts").ZType, holder: ts.Node): void => {
+      switch (t.k) {
+        case "struct": {
+          if (reachable.has(t.name)) return;
+          reachable.add(t.name);
+          const info = this.table.structs.get(t.name);
+          if (info) for (const f of info.fields) visit(f.type, f.decl);
+          return;
+        }
+        case "union": {
+          const info = this.table.unions.get(t.name);
+          if (info && !reachable.has(t.name)) {
+            reachable.add(t.name);
+            for (const arm of info.arms) for (const f of arm.fields) visit(f.type, f.decl);
+          }
+          return;
+        }
+        case "slice": {
+          const elem = t.elem.k === "optional" ? t.elem.inner : t.elem;
+          if (elem.k === "struct") {
+            const alias = aliasStruct(elem.name);
+            if (alias) {
+              this.report("NS1061", `A model array holds \`${elem.name}\`, a value-record alias — arrays the model keeps carry reference-stored records; declare \`${elem.name}\` as an interface.`, holder);
+            }
+          }
+          return visit(t.elem, holder);
+        }
+        case "optional":
+          return visit(t.inner, holder);
+        default:
+          return;
+      }
+    };
+    if (this.table.structs.has("Model")) visit({ k: "struct", name: "Model" }, this.table.structs.get("Model")!.decl);
+
+    const scalar = (k: string): boolean => k === "number" || k === "i64" || k === "f64" || k === "bool" || k === "enum" || k === "numAlias";
+    for (const name of reachable) {
+      const alias = aliasStruct(name);
+      if (!alias) continue;
+      const info = this.table.structs.get(name)!;
+      for (const f of info.fields) {
+        if (!scalar(f.type.k)) {
+          this.report(
+            "NS1061",
+            `\`${name}\` is a value-record alias the model keeps, but field \`${f.tsName}\` is not a scalar — value records commit shallowly, so heap-backed fields would dangle across frames; declare \`${name}\` as an interface.`,
+            f.decl,
+          );
+          break;
+        }
+      }
+    }
+
+    // By-value self-reference has no finite layout (a slice breaks the
+    // cycle by indirection; struct, union, and optional fields do not).
+    // The walk covers every by-value node — value-stored records AND
+    // tagged unions, whose arms live inline — so recursion through a
+    // singleton union refuses the same way as through a record.
+    const cycleEdge = (t: import("./types.ts").ZType): string | null => {
+      const inner = t.k === "optional" ? t.inner : t;
+      if (inner.k === "struct") return this.table.isPointerStruct(inner.name) ? null : inner.name;
+      if (inner.k === "union") return inner.name;
+      return null;
+    };
+    const byValueEdges = (name: string): string[] => {
+      const edges: string[] = [];
+      const struct = this.table.structs.get(name);
+      if (struct && !this.table.isPointerStruct(name)) {
+        for (const f of struct.fields) {
+          const edge = cycleEdge(f.type);
+          if (edge !== null) edges.push(edge);
+        }
+      }
+      const union = this.table.unions.get(name);
+      if (union) {
+        for (const arm of union.arms) {
+          for (const f of arm.fields) {
+            const edge = cycleEdge(f.type);
+            if (edge !== null) edges.push(edge);
+          }
+        }
+      }
+      return edges;
+    };
+    const cyclic = new Set<string>();
+    for (const name of [...this.table.structs.keys(), ...this.table.unions.keys()]) {
+      if (this.table.structs.has(name) && this.table.isPointerStruct(name)) continue;
+      const seen = new Set<string>([name]);
+      const stack = byValueEdges(name);
+      while (stack.length > 0) {
+        const next = stack.pop()!;
+        if (next === name) {
+          cyclic.add(name);
+          break;
+        }
+        if (seen.has(next)) continue;
+        seen.add(next);
+        stack.push(...byValueEdges(next));
+      }
+    }
+    for (const name of cyclic) {
+      const decl = this.table.structs.get(name)?.decl ?? this.table.unions.get(name)?.decl;
+      if (decl === undefined) continue;
+      const declName = (decl as ts.InterfaceDeclaration | ts.TypeAliasDeclaration | ts.ClassDeclaration).name ?? decl;
+      this.report("NS1061", `\`${name}\` reaches itself by value — a by-value layout has no finite size when it contains itself; break the cycle with an array, or store the record in the model (reference storage).`, declName);
+    }
+
+    // Identity comparison over a value record compares nothing the
+    // storage carries. Union operand types (`Pos | null`) check every
+    // constituent, and plain type aliases resolve to their targets, so
+    // a wrapped spelling cannot slip a value record past the guard.
+    const aliasStructNamed = (spelling: string): string | null => {
+      let named = spelling;
+      const seen = new Set<string>();
+      while (!seen.has(named)) {
+        seen.add(named);
+        const target = this.table.plainAliases.get(named);
+        if (target === undefined) break;
+        named = target;
+      }
+      return aliasStruct(named) !== null ? named : null;
+    };
+    const aliasStructOfType = (t: ts.Type): string | null => {
+      if (t.isUnion()) {
+        for (const constituent of t.types) {
+          const named = aliasStructOfType(constituent);
+          if (named !== null) return named;
+        }
+        return null;
+      }
+      const named = t.aliasSymbol?.name ?? t.symbol?.name;
+      if (!named) return null;
+      return aliasStructNamed(named);
+    };
+    for (const file of this.files) {
+      const walkEq = (node: ts.Node): void => {
+        if (
+          ts.isBinaryExpression(node) &&
+          (node.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken ||
+            node.operatorToken.kind === ts.SyntaxKind.ExclamationEqualsEqualsToken)
+        ) {
+          // Identity is only in question when BOTH sides can be
+          // records at once: a presence check against null (or any
+          // never-a-record operand) compares the option, not the
+          // record, and stays exact. Operands are typed with their
+          // assertions PEELED — an `as` erases at emission, so the
+          // compared value is the underlying expression's, and a
+          // structural respelling cannot shed the record's name. The
+          // record test on the OTHER side is structural for the same
+          // reason.
+          const peel = (e: ts.Expression): ts.Expression => {
+            let cur = e;
+            while (ts.isParenthesizedExpression(cur) || ts.isAsExpression(cur) || ts.isSatisfiesExpression(cur) || ts.isNonNullExpression(cur)) {
+              cur = cur.expression;
+            }
+            return cur;
+          };
+          const canBeRecord = (t: ts.Type): boolean => {
+            if (t.isUnion()) return t.types.some(canBeRecord);
+            return (t.flags & ts.TypeFlags.Object) !== 0;
+          };
+          // Each operand is read through BOTH views — the peeled
+          // expression (assertions erase at emission) and the spelled
+          // one (an assertion may be what NAMES the record) — so
+          // neither adding nor shedding a spelling moves a comparison
+          // past the guard.
+          const sideView = (e: ts.Expression): { named: string | null; record: boolean } => {
+            const peeled = this.tast.typeOf(peel(e));
+            const spelled = this.tast.typeOf(e);
+            return {
+              named: aliasStructOfType(peeled) ?? aliasStructOfType(spelled),
+              record: canBeRecord(peeled) || canBeRecord(spelled),
+            };
+          };
+          const left = sideView(node.left);
+          const right = sideView(node.right);
+          const named = left.named ?? right.named;
+          if (named !== null && (left.named === null ? left.record : right.record)) {
+            this.report("NS1061", `\`${named}\` values compare by content, not identity — a value-record alias has no reference to compare; compare its fields, or declare \`${named}\` as an interface for identity.`, node);
+          }
+        }
+        ts.forEachChild(node, walkEq);
+      };
+      walkEq(file);
+    }
+  }
+
   // --------------------------------------------------------- module surface
 
   private checkModuleShape(file: ts.SourceFile): void {
@@ -780,7 +1076,7 @@ export class SubsetChecker {
         continue;
       }
       const targetName = ts.isFunctionDeclaration(target) || ts.isVariableDeclaration(target) ? target.name?.getText() : undefined;
-      if (b.renamed && (targetName === "viewUnbound" || targetName === "envMsgs")) {
+      if (b.renamed && (targetName === "viewUnbound" || targetName === "envMsgs" || targetName === "modelUnbound" || targetName === "msgUnbound")) {
         this.report(
           "NS1047",
           `\`${b.exportedName}\` renames \`${targetName}\`, which is wiring config the build reads by its own name, not an emitted value.`,
@@ -796,7 +1092,7 @@ export class SubsetChecker {
   private static readonly entryOnlyExports = new Set([
     "update", "initialModel", "subscriptions",
     "commandMsg", "keyMsg", "frameMsg", "pinchMsg", "appearanceMsg", "chromeMsg", "envMsgs",
-    "viewUnbound",
+    "viewUnbound", "modelUnbound", "msgUnbound",
   ]);
 
   private checkEntryContract(): void {
@@ -1844,6 +2140,13 @@ export class SubsetChecker {
           const propDecl = this.tast.declarationOf(fieldWrite.name);
           if (propDecl && ts.isPropertyDeclaration(propDecl)) {
             this.checkInstanceMutation(fieldWrite.expression, node, what);
+          }
+          // Record fields (interface or object-alias members) have no
+          // in-place write in the emitted layout — records update by
+          // reconstruction. tsc already fences `readonly` spellings;
+          // this closes the mutable-declared ones the same way.
+          if (propDecl && ts.isPropertySignature(propDecl)) {
+            this.report("NS1001", `${what} mutates a record in place — records update by reconstruction (\`{ ...value, ${fieldWrite.name.text}: v }\`).`, node);
           }
         }
         if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {

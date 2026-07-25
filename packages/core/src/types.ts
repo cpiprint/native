@@ -39,7 +39,7 @@ export interface ZField {
 
 export interface StructInfo {
   readonly name: string;
-  readonly decl: ts.InterfaceDeclaration | ts.ClassDeclaration;
+  readonly decl: ts.InterfaceDeclaration | ts.ClassDeclaration | ts.TypeAliasDeclaration;
   /// Filled in the second collection pass (field types may reference types
   /// declared in any of the core's files, in any order).
   fields: readonly ZField[];
@@ -265,6 +265,24 @@ export class TypeTable {
           this.declOrder.push(name);
           continue;
         }
+        if (ts.isTypeLiteralNode(stmt.type) && this.tast.propsOfTypeLiteral(stmt.type) !== null) {
+          // A plain-record object-literal alias is a struct exactly like
+          // an interface; the alias FORM is how a contract projection
+          // spells a value-stored record (interfaces spell node
+          // storage), and the storage itself still comes from the
+          // promotion walk. Shapes the plain-record walk cannot carry
+          // whole (quoted or optional properties) stay unclassified and
+          // refuse at emission instead of losing fields silently.
+          this.structs.set(name, {
+            name,
+            decl: stmt,
+            fields: [],
+            exported,
+            promoted: true, // refined by markPromotions
+          });
+          this.declOrder.push(name);
+          continue;
+        }
         if (ts.isTypeReferenceNode(stmt.type) && ts.isIdentifier(stmt.type.typeName)) {
           const target = stmt.type.typeName.text;
           if (target === "Uint8Array") {
@@ -298,6 +316,11 @@ export class TypeTable {
           if (disc) {
             info.arms = disc.map((m) => ({ tag: m.tag, fields: m.fields.map((p) => this.fieldOf(p)) }));
           }
+        }
+        const structInfo = this.structs.get(stmt.name.text);
+        if (structInfo && structInfo.decl === stmt && ts.isTypeLiteralNode(stmt.type)) {
+          const props = this.tast.propsOfTypeLiteral(stmt.type);
+          if (props) structInfo.fields = props.map((p) => this.fieldOf(p));
         }
       }
     }
@@ -363,6 +386,16 @@ export class TypeTable {
           if (f.type.k === "struct") pointerKind.delete(f.type.name);
         }
       }
+    }
+    // Declaration form pins storage for object-literal aliases: the
+    // alias spelling IS the value-storage form (a contract projection
+    // spells value records that way; interfaces stay with the
+    // reachability walk above), so an alias-declared record keeps its
+    // by-value layout however the Model reaches it. The walk still
+    // traversed its fields, so interface records nested inside it
+    // promote normally.
+    for (const info of this.structs.values()) {
+      if (ts.isTypeAliasDeclaration(info.decl)) pointerKind.delete(info.name);
     }
     for (const name of pointerKind) {
       const info = this.structs.get(name);

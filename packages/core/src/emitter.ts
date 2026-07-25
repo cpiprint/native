@@ -1174,8 +1174,47 @@ export class Emitter {
       const name = this.moduleNameOf(decl) ?? decl.name.text;
       // The dead-state opt-out list is transpiler config, not module data:
       // already validated and routed into the Model/Msg `view_unbound`
-      // declarations (viewUnboundNames), nothing to emit here.
+      // declarations (viewUnboundNames), nothing to emit here. The split
+      // modelUnbound/msgUnbound pair spells the same facts for contract
+      // consumers that read declarations per side; this lane reads
+      // viewUnbound only, so the pair passes through unemitted — but the
+      // names stay RESERVED contract vocabulary: a data const under either
+      // spelling would emit no declaration while its references still
+      // emit, so anything but the list shape refuses here.
       if (name === "viewUnbound") continue;
+      if (name === "modelUnbound" || name === "msgUnbound") {
+        let init = decl.initializer;
+        while (ts.isParenthesizedExpression(init) || ts.isAsExpression(init) || ts.isSatisfiesExpression(init)) init = init.expression;
+        if (!ts.isArrayLiteralExpression(init) || init.elements.some((el) => !ts.isStringLiteral(el))) {
+          this.fail(decl, `\`${name}\` is the contract's unbound-list vocabulary and must be a const array of string literals; rename the constant to keep it as module data`, "NS1032");
+        }
+        // The split pair RESTATES viewUnbound's facts for consumers
+        // that read declarations per side, so its entries must resolve
+        // and the resolved sets must be one set — two spellings of one
+        // fact can never disagree.
+        const entries = init.elements.map((el) => (el as ts.StringLiteral).text);
+        const resolved = name === "modelUnbound" ? this.unbound.model : this.unbound.msg;
+        const side = name === "modelUnbound" ? "Model field or exported model helper" : "Msg kind";
+        for (const entry of entries) {
+          if (!resolved.includes(entry)) {
+            this.fail(
+              decl,
+              `\`${name}\` names \`"${entry}"\`, which \`viewUnbound\` does not resolve as a ${side} — the split pair restates viewUnbound's facts, so declare the name there (and as a real ${side}) first`,
+              "NS1032",
+            );
+          }
+        }
+        for (const entry of resolved) {
+          if (!entries.includes(entry)) {
+            this.fail(
+              decl,
+              `\`${name}\` is missing \`"${entry}"\`, which \`viewUnbound\` declares on this side — the split pair restates viewUnbound's facts, never a subset of them`,
+              "NS1032",
+            );
+          }
+        }
+        continue;
+      }
       // The env override channel: a declarative table the generated wiring
       // walks at comptime (read the named variables once at launch,
       // dispatch each present value through its bytes arm).
@@ -1594,7 +1633,7 @@ export class Emitter {
 
   // ------------------------------------------------------------------ types
 
-  private emitStruct(decl: ts.InterfaceDeclaration | ts.ClassDeclaration): void {
+  private emitStruct(decl: ts.InterfaceDeclaration | ts.ClassDeclaration | ts.TypeAliasDeclaration): void {
     if (!decl.name) return;
     const info = this.table.structs.get(decl.name.text);
     if (!info) return;
@@ -1920,6 +1959,13 @@ export class Emitter {
         this.out.push(`    pub const view_unbound = .{ ${this.unbound.msg.map((n) => `"${n}"`).join(", ")} };`);
       }
       this.out.push(`};`);
+      return;
+    }
+    const st = this.table.structs.get(name);
+    if (st && st.decl === decl) {
+      // An object-literal alias is a struct like an interface (the alias
+      // form is a contract projection's value-storage spelling).
+      this.emitStruct(decl);
       return;
     }
     const target = this.table.plainAliases.get(name);
@@ -8901,6 +8947,20 @@ export class Emitter {
       // names — the overlap of the two string sets, resolved at compile time.
       const lt = unwrapOptional(this.zTypeOfExpr(expr.left, ctx));
       const rt = unwrapOptional(this.zTypeOfExpr(expr.right, ctx));
+      // Layer-3 re-derivation of NS1061: identity over a by-value record
+      // has no reference to compare (a pointer-stored record's `==` IS
+      // its identity). This is the emission-time authority, so operands
+      // that reached here through generic instantiation or erased
+      // assertions stop the same way the checker teaches directly.
+      for (const t of [lt, rt]) {
+        if (t.k === "struct" && !this.table.isPointerStruct(t.name)) {
+          this.fail(
+            expr,
+            `\`${op === ts.SyntaxKind.EqualsEqualsEqualsToken ? "===" : "!=="}\` compares \`${t.name}\` values by identity, which value storage does not carry — compare fields, or store the record by reference for identity`,
+            "NS1061",
+          );
+        }
+      }
       if (lt.k === "enum" && rt.k === "enum" && lt.name !== rt.name) {
         const l = this.emitExpr(expr.left, ctx).code;
         const r = this.emitExpr(expr.right, ctx).code;

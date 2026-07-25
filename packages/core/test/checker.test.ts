@@ -2,7 +2,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { checkOnly, ruleIds, transpile } from "./helpers.ts";
+import { checkOnly, ruleIds, transpile, transpileFiles } from "./helpers.ts";
 
 const core = `
 export interface Model { readonly count: number; }
@@ -784,4 +784,299 @@ export function update(model: Model, msg: Msg): Model {
 }
 `);
   assert.ok(!ruleIds(clean).includes("NS1032"), `got ${ruleIds(clean)}`);
+});
+
+test("NS1061: value-record aliases refuse the shapes value storage cannot carry", () => {
+  // The model root is reference storage by contract.
+  const root = checkOnly(`
+export type Model = { readonly n: number };
+export type Msg = { readonly kind: "a" } | { readonly kind: "b" };
+export function initialModel(): Model { return { n: 0 }; }
+export function update(model: Model, msg: Msg): Model { return model; }
+`);
+  assert.ok(ruleIds(root).includes("NS1061"), `got ${ruleIds(root)}`);
+
+  // A model-kept alias with a heap-backed field would dangle across
+  // frames — through an optional wrapper all the same.
+  const heap = checkOnly(`
+export type Cache = { readonly data: Uint8Array };
+export interface Model { readonly cache: Cache | null; }
+export type Msg = { readonly kind: "a" } | { readonly kind: "b" };
+export function initialModel(): Model { return { cache: null }; }
+export function update(model: Model, msg: Msg): Model { return model; }
+`);
+  assert.ok(ruleIds(heap).includes("NS1061"), `got ${ruleIds(heap)}`);
+
+  // Model arrays carry reference-stored records.
+  const arr = checkOnly(`
+export type Pos = { readonly x: number };
+export interface Model { readonly points: readonly Pos[]; }
+export type Msg = { readonly kind: "a" } | { readonly kind: "b" };
+export function initialModel(): Model { return { points: [] }; }
+export function update(model: Model, msg: Msg): Model { return model; }
+`);
+  assert.ok(ruleIds(arr).includes("NS1061"), `got ${ruleIds(arr)}`);
+
+  // Identity comparison over a value record compares nothing the
+  // storage carries.
+  const eq = checkOnly(`
+export type Pos = { readonly x: number };
+export interface Model { readonly pos: Pos; readonly n: number; }
+export type Msg = { readonly kind: "moved"; readonly pos: Pos } | { readonly kind: "b" };
+export function initialModel(): Model { return { pos: { x: 0 }, n: 0 }; }
+export function update(model: Model, msg: Msg): Model {
+  if (msg.kind === "moved") {
+    return { pos: msg.pos, n: model.pos === msg.pos ? 1 : 0 };
+  }
+  return model;
+}
+`);
+  assert.ok(ruleIds(eq).includes("NS1061"), `got ${ruleIds(eq)}`);
+
+  // A self-reference has no finite by-value layout.
+  const cyclic = checkOnly(`
+export type Link = { readonly next: Link | null };
+export interface Model { readonly n: number; }
+export type Msg = { readonly kind: "a"; readonly link: Link } | { readonly kind: "b" };
+export function initialModel(): Model { return { n: 0 }; }
+export function update(model: Model, msg: Msg): Model { return model; }
+`);
+  assert.ok(ruleIds(cyclic).includes("NS1061"), `got ${ruleIds(cyclic)}`);
+
+  // The scalar shapes value storage exists for stay clean: a scalar
+  // alias kept by the model directly, and a heap-carrying alias that
+  // never enters the model tree.
+  const clean = checkOnly(`
+export type Pos = { readonly x: number; readonly y: number };
+export type Note = { readonly text: Uint8Array };
+export interface Model { readonly pos: Pos; readonly n: number; }
+export type Msg = { readonly kind: "noted"; readonly note: Note } | { readonly kind: "b" };
+export function initialModel(): Model { return { pos: { x: 1, y: 2 }, n: 0 }; }
+export function update(model: Model, msg: Msg): Model { return model; }
+`);
+  assert.ok(!ruleIds(clean).includes("NS1061"), `got ${ruleIds(clean)}`);
+});
+
+test("NS1062: the entry roots keep their contract shapes", () => {
+  // A plain object alias (or an interface) named Msg has no dispatch
+  // path; a tagged singleton named Model has no commit path.
+  const structMsg = checkOnly(`
+export type Msg = { readonly value: number };
+export interface Model { readonly n: number; }
+export function initialModel(): Model { return { n: 0 }; }
+export function update(model: Model, msg: Msg): Model { return model; }
+`);
+  assert.ok(ruleIds(structMsg).includes("NS1062"), `got ${ruleIds(structMsg)}`);
+
+  const interfaceMsg = checkOnly(`
+export interface Msg { readonly value: number; }
+export interface Model { readonly n: number; }
+export function initialModel(): Model { return { n: 0 }; }
+export function update(model: Model, msg: Msg): Model { return model; }
+`);
+  assert.ok(ruleIds(interfaceMsg).includes("NS1062"), `got ${ruleIds(interfaceMsg)}`);
+
+  const unionModel = checkOnly(`
+export type Model = { readonly kind: "ready"; readonly count: number };
+export type Msg = { readonly kind: "a" } | { readonly kind: "b" };
+export function initialModel(): Model { return { kind: "ready", count: 0 }; }
+export function update(model: Model, msg: Msg): Model { return model; }
+`);
+  assert.ok(ruleIds(unionModel).includes("NS1062"), `got ${ruleIds(unionModel)}`);
+});
+
+test("NS1061: by-value recursion through a singleton union and wrapped identity comparison refuse", () => {
+  const unionCycle = checkOnly(`
+export type Link = { readonly kind: "link"; readonly next: Link | null };
+export interface Model { readonly n: number; }
+export type Msg = { readonly kind: "a"; readonly link: Link } | { readonly kind: "b" };
+export function initialModel(): Model { return { n: 0 }; }
+export function update(model: Model, msg: Msg): Model { return model; }
+`);
+  assert.ok(ruleIds(unionCycle).includes("NS1061"), `got ${ruleIds(unionCycle)}`);
+
+  const nullableEq = checkOnly(`
+export type Pos = { readonly x: number };
+export interface Model { readonly pos: Pos | null; readonly n: number; }
+export type Msg = { readonly kind: "moved"; readonly pos: Pos | null } | { readonly kind: "b" };
+export function initialModel(): Model { return { pos: null, n: 0 }; }
+export function update(model: Model, msg: Msg): Model {
+  if (msg.kind === "moved") {
+    return { pos: msg.pos, n: model.pos === msg.pos ? 1 : 0 };
+  }
+  return model;
+}
+`);
+  assert.ok(ruleIds(nullableEq).includes("NS1061"), `got ${ruleIds(nullableEq)}`);
+
+  // An array breaks the cycle by indirection: a tree over a kids list
+  // stays clean.
+  const treeOverArray = checkOnly(`
+export type Tree = { readonly kind: "node"; readonly label: number } | { readonly kind: "branch"; readonly kids: readonly Tree[] };
+export interface Model { readonly n: number; }
+export type Msg = { readonly kind: "a"; readonly tree: Tree } | { readonly kind: "b" };
+export function initialModel(): Model { return { n: 0 }; }
+export function update(model: Model, msg: Msg): Model { return model; }
+`);
+  assert.ok(!ruleIds(treeOverArray).includes("NS1061"), `got ${ruleIds(treeOverArray)}`);
+});
+
+test("NS1061/NS1062: presence checks pass; optional arm payloads and class roots refuse", () => {
+  // A nullable presence check compares the option, not the record.
+  const presence = checkOnly(`
+export type Pos = { readonly x: number };
+export interface Model { readonly pos: Pos | null; readonly n: number; }
+export type Msg = { readonly kind: "a" } | { readonly kind: "b" };
+export function initialModel(): Model { return { pos: null, n: 0 }; }
+export function update(model: Model, msg: Msg): Model {
+  if (model.pos !== null) {
+    return { pos: model.pos, n: model.pos.x };
+  }
+  return model;
+}
+`);
+  assert.ok(!ruleIds(presence).includes("NS1061"), `got ${ruleIds(presence)}`);
+
+  // An optional payload property has no native slot: the shape is not a
+  // kind-tagged union, so the Msg root refuses with the teaching.
+  const optionalArm = checkOnly(`
+export interface Model { readonly n: number; }
+export type Msg = { readonly kind: "set"; readonly value?: number } | { readonly kind: "b" };
+export function initialModel(): Model { return { n: 0 }; }
+export function update(model: Model, msg: Msg): Model { return model; }
+`);
+  assert.ok(ruleIds(optionalArm).includes("NS1062"), `got ${ruleIds(optionalArm)}`);
+
+  // A class named Msg is a struct, never a tagged union.
+  const classMsg = checkOnly(`
+export interface Model { readonly n: number; }
+export class Msg {
+  value: number = 0;
+  constructor(value: number) { this.value = value; }
+}
+export function initialModel(): Model { return { n: 0 }; }
+export function update(model: Model, msg: Msg): Model { return model; }
+`);
+  assert.ok(ruleIds(classMsg).includes("NS1062"), `got ${ruleIds(classMsg)}`);
+});
+
+test("NS1061: an assertion-erased operand cannot slip identity comparison", () => {
+  const asserted = checkOnly(`
+export type Pos = { readonly x: number };
+export interface Model { readonly pos: Pos; readonly n: number; }
+export type Msg = { readonly kind: "moved"; readonly pos: Pos } | { readonly kind: "b" };
+export function initialModel(): Model { return { pos: { x: 0 }, n: 0 }; }
+export function update(model: Model, msg: Msg): Model {
+  if (msg.kind === "moved") {
+    return { pos: msg.pos, n: model.pos === (msg.pos as { readonly x: number }) ? 1 : 0 };
+  }
+  return model;
+}
+`);
+  assert.ok(ruleIds(asserted).includes("NS1061"), `got ${ruleIds(asserted)}`);
+});
+
+test("NS1061/NS1001/NS1014/NS1032: round-trip edges of the value-record and unbound surfaces", () => {
+  // Both operands asserted: assertions erase at emission, so the guard
+  // types the peeled expressions.
+  const bothAsserted = checkOnly(`
+export type Pos = { readonly x: number };
+export interface Model { readonly pos: Pos; readonly n: number; }
+export type Msg = { readonly kind: "moved"; readonly pos: Pos } | { readonly kind: "b" };
+export function initialModel(): Model { return { pos: { x: 0 }, n: 0 }; }
+export function update(model: Model, msg: Msg): Model {
+  if (msg.kind === "moved") {
+    return { pos: msg.pos, n: (model.pos as { readonly x: number }) === (msg.pos as { readonly x: number }) ? 1 : 0 };
+  }
+  return model;
+}
+`);
+  assert.ok(ruleIds(bothAsserted).includes("NS1061"), `got ${ruleIds(bothAsserted)}`);
+
+  // Record fields have no in-place write: mutation through a mutable
+  // property refuses with the reconstruction teaching.
+  const paramWrite = checkOnly(`
+export type Pos = { x: number };
+export interface Model { readonly n: number; }
+export type Msg = { readonly kind: "a"; readonly pos: Pos } | { readonly kind: "b" };
+function bump(p: Pos): number { p.x++; return p.x; }
+export function initialModel(): Model { return { n: 0 }; }
+export function update(model: Model, msg: Msg): Model {
+  if (msg.kind === "a") { return { n: bump({ x: 1 }) }; }
+  return model;
+}
+`);
+  assert.ok(ruleIds(paramWrite).includes("NS1001"), `got ${ruleIds(paramWrite)}`);
+
+  // An unexported reserved const in an imported module is inert
+  // configuration and refuses like the exported form.
+  const imported = transpileFiles({
+    "core.ts": `
+import { other } from "./lists.ts";
+export interface Model { readonly n: number; readonly hidden: number; }
+export type Msg = { readonly kind: "a" } | { readonly kind: "b" };
+export function initialModel(): Model { return { n: other, hidden: 1 }; }
+export function update(model: Model, msg: Msg): Model { return model; }
+`,
+    "lists.ts": `const modelUnbound = ["hidden"] as const;\nexport const other = modelUnbound.length;\n`,
+  });
+  assert.equal(imported.ok, false);
+  assert.ok(imported.diagnostics.some((d) => d.id === "NS1014"), JSON.stringify(imported.diagnostics));
+
+  // The split pair restates viewUnbound's facts: an unresolvable entry
+  // and a missing one both refuse.
+  const unresolvable = transpile(`
+export interface Model { readonly n: number; readonly hidden: number; }
+export type Msg = { readonly kind: "a" } | { readonly kind: "b" };
+export const viewUnbound = ["hidden"] as const;
+export const modelUnbound = ["nope"] as const;
+export function initialModel(): Model { return { n: 0, hidden: 1 }; }
+export function update(model: Model, msg: Msg): Model { return model; }
+`);
+  assert.equal(unresolvable.ok, false);
+  assert.ok(unresolvable.diagnostics.some((d) => d.id === "NS1032"), JSON.stringify(unresolvable.diagnostics));
+
+  const missing = transpile(`
+export interface Model { readonly n: number; readonly hidden: number; }
+export type Msg = { readonly kind: "a" } | { readonly kind: "probe"; readonly value: number };
+export const viewUnbound = ["hidden", "probe"] as const;
+export const msgUnbound = [] as const;
+export function initialModel(): Model { return { n: 0, hidden: 1 }; }
+export function update(model: Model, msg: Msg): Model { return model; }
+`);
+  assert.equal(missing.ok, false);
+  assert.ok(missing.diagnostics.some((d) => d.id === "NS1032"), JSON.stringify(missing.diagnostics));
+});
+
+test("NS1061: generic and literal-asserted identity stop; enum-kind records stay structs", () => {
+  // Identity through a generic instantiation stops at emission with the
+  // same teaching the checker gives directly.
+  const generic = transpile(`
+export type Pos = { readonly x: number };
+export interface Model { readonly pos: Pos; readonly n: number; }
+export type Msg = { readonly kind: "moved"; readonly pos: Pos } | { readonly kind: "b" };
+function same<T>(a: T, b: T): boolean { return a === b; }
+export function initialModel(): Model { return { pos: { x: 0 }, n: 0 }; }
+export function update(model: Model, msg: Msg): Model {
+  if (msg.kind === "moved") {
+    return { pos: msg.pos, n: same(model.pos, msg.pos) ? 1 : 0 };
+  }
+  return model;
+}
+`);
+  assert.equal(generic.ok, false);
+  assert.ok(generic.diagnostics.some((d) => d.id === "NS1061"), JSON.stringify(generic.diagnostics));
+
+  // An assertion may be what NAMES the record: both views are read, so
+  // literal-asserted operands refuse at check time.
+  const asserted = checkOnly(`
+export type Pos = { readonly x: number };
+export interface Model { readonly n: number; }
+export type Msg = { readonly kind: "a"; readonly pos: Pos } | { readonly kind: "b" };
+export function initialModel(): Model { return { n: 0 }; }
+export function update(model: Model, msg: Msg): Model {
+  return { n: ({ x: 1 } as Pos) === ({ x: 1 } as Pos) ? 1 : 0 };
+}
+`);
+  assert.ok(ruleIds(asserted).includes("NS1061"), `got ${ruleIds(asserted)}`);
 });
