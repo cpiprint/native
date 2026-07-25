@@ -2288,6 +2288,22 @@ pub fn RuntimeCanvasWidgetEvents(comptime Runtime: type) type {
             try dispatchCanvasWidgetCommandForId(self, app, index, target.id);
         }
 
+        /// Returns true for an auto-repeat or release belonging to the
+        /// physical Tab gesture that moved focus into a live terminal.
+        /// The caller suppresses that transition; the release also
+        /// retires the gesture latch.
+        pub fn consumeCanvasWidgetTerminalFocusEntryTab(self: *Runtime, input_event: GpuSurfaceInputEvent) bool {
+            if (input_event.kind != .key_down and input_event.kind != .key_up) return false;
+            if (!std.ascii.eqlIgnoreCase(input_event.key, "tab")) return false;
+            const index = runtimeFindViewIndex(self, input_event.window_id, input_event.label) orelse return false;
+            if (self.views[index].kind != .gpu_surface) return false;
+            if (!self.views[index].canvas_widget_terminal_focus_entry_tab_held) return false;
+            if (input_event.kind == .key_up) {
+                self.views[index].canvas_widget_terminal_focus_entry_tab_held = false;
+            }
+            return true;
+        }
+
         /// Returns true when the key moved keyboard focus to a DIFFERENT
         /// widget — the caller stamps it onto the routed keyboard event
         /// (`focus_moved`) so tree rows can tell selection-follows-focus
@@ -2298,17 +2314,40 @@ pub fn RuntimeCanvasWidgetEvents(comptime Runtime: type) type {
             if (self.views[index].kind != .gpu_surface) return false;
 
             const current_id: ?canvas.ObjectId = if (self.views[index].canvas_widget_focused_id == 0) null else self.views[index].canvas_widget_focused_id;
+            const layout = self.views[index].widgetLayoutTree();
             if (std.ascii.eqlIgnoreCase(input_event.key, "tab")) {
+                // A terminal owns Tab as INPUT (completion, indentation,
+                // and TUI navigation), not as focus traversal. Decide
+                // against the pre-key focus before choosing the next
+                // target: the routed keyboard pass below will therefore
+                // address this same terminal and its emulator can encode
+                // Tab/Shift+Tab for the pty. Disabled/hidden terminals
+                // cannot occupy the focus register because
+                // focusTargetById rejects them, so stale focus still
+                // falls through to the ordinary traversal repair.
+                if (current_id) |id| {
+                    if (layout.focusTargetById(id)) |current| {
+                        if (canvasWidgetTerminalOwnsTabInput(layout, current)) return false;
+                    }
+                }
                 const direction: canvas.WidgetFocusDirection = if (input_event.modifiers.shift) .backward else .forward;
                 const target = if (current_id) |id|
-                    self.views[index].canvasWidgetScopedFocusTarget(id, direction) orelse self.views[index].widgetLayoutTree().focusTarget(current_id, direction) orelse return false
+                    self.views[index].canvasWidgetScopedFocusTarget(id, direction) orelse layout.focusTarget(current_id, direction) orelse return false
                 else
-                    self.views[index].widgetLayoutTree().focusTarget(current_id, direction) orelse return false;
-                return try setCanvasWidgetFocusFromKeyboardMoved(self, index, current_id, target.id);
+                    layout.focusTarget(current_id, direction) orelse return false;
+                const moved = try setCanvasWidgetFocusFromKeyboardMoved(self, index, current_id, target.id);
+                if (moved and canvasWidgetTerminalOwnsTabInput(layout, target)) {
+                    // The key-down moved focus INTO this live terminal;
+                    // it is traversal, not terminal input. Hold that
+                    // classification through auto-repeat and key-up so
+                    // the same physical gesture cannot leak a Tab press
+                    // (legacy) or orphan release (kitty) into the pty.
+                    self.views[index].canvas_widget_terminal_focus_entry_tab_held = true;
+                }
+                return moved;
             }
 
             const focused_id = current_id orelse return false;
-            const layout = self.views[index].widgetLayoutTree();
             const focused = layout.focusTargetById(focused_id) orelse return false;
             // FRAMEWORK BEHAVIOR CHANGE (deliberate, scoped — the same
             // seam as the keyboard-routing gate below): arrows and
@@ -2439,6 +2478,14 @@ fn runtimeFindViewIndex(self: anytype, window_id: platform.WindowId, label: []co
         if (view.open and view.window_id == window_id and std.mem.eql(u8, view.label, label)) return index;
     }
     return null;
+}
+
+fn canvasWidgetTerminalOwnsTabInput(layout: canvas.WidgetLayoutTree, target: canvas.WidgetFocusTarget) bool {
+    if (target.kind != .terminal or target.index >= layout.nodes.len) return false;
+    const terminal = layout.nodes[target.index].widget.terminal;
+    if (terminal.pty == 0) return false;
+    const grid = terminal.grid orelse return false;
+    return grid.running;
 }
 
 fn canvasDirtyRegionForView(view_frame: geometry.RectF, local_dirty: geometry.RectF) ?geometry.RectF {
