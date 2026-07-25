@@ -138,6 +138,7 @@ pub fn build(b: *std.Build) void {
     desktop_mod.addImport("platform_info", platform_info_mod);
     desktop_mod.addImport("json", json_mod);
     desktop_mod.addImport("canvas", canvas_mod);
+    desktop_mod.addImport("terminal_vt", terminalVtModule(b, target, optimize));
     const desktop_tests = testArtifact(b, desktop_mod);
     const desktop_test_shards = desktopTestShardArtifacts(b, desktop_mod);
 
@@ -373,6 +374,10 @@ pub fn build(b: *std.Build) void {
     wasm_native_mod.addImport("app_manifest", module(b, wasm_target, wasm_optimize, "src/primitives/app_manifest/root.zig"));
     wasm_native_mod.addImport("diagnostics", module(b, wasm_target, wasm_optimize, "src/primitives/diagnostics/root.zig"));
     wasm_native_mod.addImport("platform_info", module(b, wasm_target, wasm_optimize, "src/primitives/platform_info/root.zig"));
+    // The docs preview never runs an emulator: the stub keeps the wasm
+    // module free of the ghostty graph (and of pty transports it could
+    // not use anyway).
+    wasm_native_mod.addImport("terminal_vt", module(b, wasm_target, wasm_optimize, "src/runtime/terminal_vt_stub.zig"));
     const docs_wasm_preview_mod = module(b, wasm_target, wasm_optimize, "tools/docs_wasm_preview.zig");
     docs_wasm_preview_mod.addImport("native_sdk", wasm_native_mod);
     docs_wasm_preview_mod.strip = true;
@@ -430,6 +435,9 @@ pub fn build(b: *std.Build) void {
     pins_native_mod.addImport("platform_info", host_platform_info_mod);
     pins_native_mod.addImport("json", pins_json_mod);
     pins_native_mod.addImport("canvas", pins_canvas_mod);
+    // The pin printer reflects registry tables and layout fingerprints —
+    // type shapes, never emulator state — so the stub keeps it light.
+    pins_native_mod.addImport("terminal_vt", module(b, host_target, optimize, "src/runtime/terminal_vt_stub.zig"));
     const print_pins_mod = module(b, host_target, optimize, "tools/print_pins.zig");
     print_pins_mod.addImport("native_sdk", pins_native_mod);
     const print_pins_exe = b.addExecutable(.{
@@ -1330,6 +1338,7 @@ pub fn build(b: *std.Build) void {
     addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-split-collapse", "Run split collapse example tests", "examples/split-collapse", .managed);
     addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-system-monitor", "Run system monitor example tests", "examples/system-monitor", .managed);
     addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-terminal", "Run terminal example tests", "examples/terminal", .owned);
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-workbench", "Run workbench example tests", "examples/workbench", .owned);
     addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-system-monitor-ts", "Run system-monitor-ts example tests", "examples/system-monitor-ts", .managed);
     addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-effects-probe", "Run effects probe example tests", "examples/effects-probe", .managed);
     addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-channel-monitor", "Run channel monitor example tests", "examples/channel-monitor", .managed);
@@ -2831,6 +2840,19 @@ fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
         .target = target,
         .optimize = optimize,
     });
+}
+
+/// The framework module's `terminal_vt` import for THIS repository's own
+/// builds: always the stub. The emulator (libghostty-vt) is pinned by
+/// the APPS that want live `<terminal>` sessions, never by this package
+/// — a pin in `build.zig.zon` is materialized into every consumer's
+/// package directory even when lazy and unused, and ghostty's own graph
+/// walks translate_c/wuffs and pulls harfbuzz, which is exactly what a
+/// scaffolded app must never carry. `AppOptions.terminal_sessions`
+/// resolves the app's own pin (see build/app.zig), and the terminal
+/// examples own the enabled path's test coverage.
+fn terminalVtModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return module(b, target, optimize, "src/runtime/terminal_vt_stub.zig");
 }
 
 /// The short commit hash of the framework checkout the CLI is built
