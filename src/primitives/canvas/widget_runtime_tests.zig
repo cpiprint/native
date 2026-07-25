@@ -606,6 +606,61 @@ test "widget render state dirty bounds tracks changed runtime states" {
     try std.testing.expect(layout.renderStateDirtyBounds(.{ .focused_id = 99 }, .{ .focused_id = 100 }) == null);
 }
 
+test "widget render state dirty bounds tracks terminal logical focus" {
+    const rows = [_]canvas.TerminalRow{.{ .cells = &.{} }};
+    var grid = canvas.TerminalGrid{
+        .rows = &rows,
+        .background = Color.rgb8(0, 0, 0),
+        .foreground = Color.rgb8(255, 255, 255),
+        .cursor_color = Color.rgb8(255, 255, 255),
+        .selection_color = Color.rgb8(0, 128, 255),
+        .cursor = .{ .x = 0, .y = 0 },
+    };
+    const terminal = Widget{
+        .id = 9,
+        .kind = .terminal,
+        .frame = geometry.RectF.init(10, 12, 200, 100),
+        .terminal = .{ .pty = 1, .grid = &grid },
+    };
+    var nodes: [1]WidgetLayoutNode = undefined;
+    const layout = try layoutWidgetTree(terminal, terminal.frame, &nodes);
+
+    // Logical focus changes the live cursor from outline to fill even
+    // when focus-visible stays quiet, so the terminal frame is dirty.
+    try expectRect(
+        terminal.frame,
+        layout.renderStateDirtyBounds(.{}, .{ .focused_id = terminal.id }),
+    );
+    try expectRect(
+        terminal.frame,
+        layout.renderStateDirtyBounds(
+            .{ .focused_id = terminal.id },
+            .{ .keyboard_active = false, .focused_id = terminal.id },
+        ),
+    );
+
+    // A static/baked focused state is the source of truth when neither
+    // render state carries a focus id. The keyboard gate still hollows
+    // that cursor, so the no-id path must report its frame dirty too.
+    var baked_terminal = terminal;
+    baked_terminal.state.focused = true;
+    var baked_nodes: [1]WidgetLayoutNode = undefined;
+    const baked_layout = try layoutWidgetTree(baked_terminal, baked_terminal.frame, &baked_nodes);
+    try expectRect(
+        baked_terminal.frame,
+        baked_layout.renderStateDirtyBounds(.{}, .{ .keyboard_active = false }),
+    );
+
+    // An ended cursor is hollow in both states: logical focus no longer
+    // changes pixels, so no damage is reported.
+    grid.running = false;
+    try std.testing.expect(layout.renderStateDirtyBounds(.{}, .{ .focused_id = terminal.id }) == null);
+    try std.testing.expect(layout.renderStateDirtyBounds(
+        .{ .focused_id = terminal.id },
+        .{ .keyboard_active = false, .focused_id = terminal.id },
+    ) == null);
+}
+
 test "widget render state dirty bounds uses custom focus stroke tokens" {
     const children = [_]Widget{.{
         .id = 2,

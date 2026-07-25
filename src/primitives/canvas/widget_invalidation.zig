@@ -332,6 +332,10 @@ pub fn widgetRenderStateDirtyBounds(layout: anytype, previous: WidgetRenderState
         appendOptionalObjectId(&ids, &id_len, previous.focused_id);
         appendOptionalObjectId(&ids, &id_len, next.focused_id);
     }
+    if (previous.keyboard_active != next.keyboard_active) {
+        appendOptionalObjectId(&ids, &id_len, previous.focused_id);
+        appendOptionalObjectId(&ids, &id_len, next.focused_id);
+    }
     if (previous.focus_visible_id != next.focus_visible_id) {
         appendOptionalObjectId(&ids, &id_len, previous.focus_visible_id);
         appendOptionalObjectId(&ids, &id_len, next.focus_visible_id);
@@ -353,8 +357,40 @@ pub fn widgetRenderStateDirtyBounds(layout: anytype, previous: WidgetRenderState
         const base = widgetWithFrame(node.widget, node.frame);
         const previous_widget = widgetWithRenderState(base, previous);
         const next_widget = widgetWithRenderState(base, next);
+        // A terminal's cursor follows LOGICAL focus (`focused_id`), not
+        // the focus-visible state projected into `WidgetState.focused`.
+        // Dirtiness has to mirror that extra render dependency or a
+        // quiet pointer-focus/window-focus transition can change the
+        // cursor from hollow to filled while this API reports no pixels.
+        if (terminalLogicalFocusPaintChanged(base, previous, next)) {
+            bounds = unionOptionalBounds(bounds, widgetClippedDirtyBounds(
+                layout,
+                index,
+                widgetFullPaintBoundsWithTransform(node, widgetAccumulatedTransform(layout, index), tokens),
+            ));
+        }
         if (widgetStatesEqual(previous_widget.state, next_widget.state)) continue;
         bounds = unionOptionalBounds(bounds, widgetClippedDirtyBounds(layout, index, widgetRenderStatePaintChangeBounds(previous_widget, next_widget, tokens)));
+    }
+    // With no runtime focus ids, baked `WidgetState.focused` is the
+    // renderer's source of truth. A keyboard-active transition still
+    // changes a baked-focused terminal cursor, but the targeted id list
+    // above is empty in exactly that state. Walk the layout only for
+    // this rare window/app activity edge so the dirty-bounds API mirrors
+    // the pixels without taxing ordinary hover/press/focus changes.
+    if (previous.keyboard_active != next.keyboard_active and
+        renderStateUsesBakedFocus(previous) and
+        renderStateUsesBakedFocus(next))
+    {
+        for (layout.nodes, 0..) |node, index| {
+            const base = widgetWithFrame(node.widget, node.frame);
+            if (!terminalLogicalFocusPaintChanged(base, previous, next)) continue;
+            bounds = unionOptionalBounds(bounds, widgetClippedDirtyBounds(
+                layout,
+                index,
+                widgetFullPaintBoundsWithTransform(node, widgetAccumulatedTransform(layout, index), tokens),
+            ));
+        }
     }
     // Focus-within chrome: an `.input_group` ancestor wears the focus
     // ring FOR its focused descendant, so a focus-visible change dirties
@@ -373,6 +409,29 @@ pub fn widgetRenderStateDirtyBounds(layout: anytype, previous: WidgetRenderState
         bounds = unionOptionalBounds(bounds, widget_render.chartHoverDetailDirtyBounds(layout, next, tokens));
     }
     return bounds;
+}
+
+/// Whether a live, visible terminal cursor changes fill-vs-outline
+/// because logical keyboard focus moved. Ended sessions are always
+/// hollow and a grid without a cursor paints no focus-dependent pixels.
+fn terminalLogicalFocusPaintChanged(widget: Widget, previous: WidgetRenderState, next: WidgetRenderState) bool {
+    if (widget.kind != .terminal) return false;
+    const grid = widget.terminal.grid orelse return false;
+    if (!grid.running or grid.cursor == null) return false;
+    return widgetHasLogicalFocus(widget, previous) != widgetHasLogicalFocus(widget, next);
+}
+
+fn widgetHasLogicalFocus(widget: Widget, state: WidgetRenderState) bool {
+    if (!state.keyboard_active) return false;
+    if (state.focused_id != null or state.focus_visible_id != null) {
+        const focused_id = state.focused_id orelse return false;
+        return widget.id != 0 and widget.id == focused_id;
+    }
+    return widget.state.focused;
+}
+
+fn renderStateUsesBakedFocus(state: WidgetRenderState) bool {
+    return state.focused_id == null and state.focus_visible_id == null;
 }
 
 fn optionalPointsEqual(a: ?geometry.PointF, b: ?geometry.PointF) bool {
