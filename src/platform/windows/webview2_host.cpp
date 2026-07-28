@@ -336,6 +336,17 @@ struct Window {
      * the natural minimum (WM_GETMINMAXINFO applies the floor). */
     double min_width = 0;
     double min_height = 0;
+    /* Creation-time overlay presentation. Installed before first show. */
+    bool transparent = false;
+    bool always_on_top = false;
+    bool click_through = false;
+    bool activate_on_show = true;
+    bool show_on_first_present = false;
+    bool shown = false;
+    /* GetTickCount64 value captured when an on-first-present window is
+     * created. The per-window frame timer owns the one-second safety
+     * reveal; immediate/already shown windows do not consult it. */
+    ULONGLONG deferred_show_started_ms = 0;
     /* Last DWMWA_CAPTION_COLOR pushed for the hidden styles (sampled
      * from the presented header pixels so the DWM caption material
      * behind the button cluster matches the app's header). */
@@ -512,6 +523,7 @@ constexpr UINT_PTR kAppTimerIdBase = 0x1000;
 /* The 16 ms per-window frame-pump timer (SetTimer id on each top-level
  * window; distinct from the app-timer id range). */
 constexpr UINT_PTR kFrameTimerId = 1;
+constexpr ULONGLONG kDeferredShowDeadlineMs = 1000;
 
 struct AppTimer {
     uint64_t id = 0;
@@ -2698,6 +2710,191 @@ static void paintGpuSurface(NativeView &view, HWND hwnd, HDC dc) {
     StretchDIBits(dc, 0, 0, client_width, client_height, 0, 0, view.gpu_buf_width, view.gpu_buf_height, view.gpu_bgra.data(), &info, DIB_RGB_COLORS, SRCCOPY);
 }
 
+static constexpr uint8_t compositePremultipliedChannel(uint8_t source, uint8_t source_alpha, uint8_t destination) {
+    return static_cast<uint8_t>(source +
+        (static_cast<uint32_t>(destination) * (255u - source_alpha) + 127u) / 255u);
+}
+
+static_assert(
+    compositePremultipliedChannel(128, 128, 64) == 160 &&
+    compositePremultipliedChannel(128, 128, 128) == 192,
+    "premultiplied source-over must preserve destination contribution");
+
+/* User32 excludes alpha-zero pixels before WM_NCHITTEST reaches a
+ * per-pixel layered window. Keep the real WS_THICKFRAME resize bands at
+ * the smallest nonzero alpha so they remain pointer targets without
+ * making the transparent frame visibly opaque. Client pixels stay zero
+ * until a canvas paints them, preserving intentional transparent holes.
+ * click_through still wins in windowProc by returning HTTRANSPARENT. */
+static constexpr uint8_t kTransparentResizeHitAlpha = 1;
+
+static constexpr bool outsideTransparentClientBounds(
+    int x,
+    int y,
+    int client_left,
+    int client_top,
+    int client_right,
+    int client_bottom) {
+    return x < client_left || x >= client_right || y < client_top || y >= client_bottom;
+}
+
+static_assert(
+    outsideTransparentClientBounds(6, 100, 7, 7, 713, 513) &&
+    !outsideTransparentClientBounds(7, 100, 7, 7, 713, 513),
+    "the non-client resize band must stop exactly where the client begins");
+
+static void seedTransparentResizeHitFrame(
+    uint8_t *target,
+    int outer_width,
+    int outer_height,
+    int client_left,
+    int client_top,
+    int client_right,
+    int client_bottom) {
+    const int left = std::max(0, std::min(outer_width, client_left));
+    const int top = std::max(0, std::min(outer_height, client_top));
+    const int right = std::max(left, std::min(outer_width, client_right));
+    const int bottom = std::max(top, std::min(outer_height, client_bottom));
+    const auto seed_span = [&](int y, int begin, int end) {
+        for (int x = begin; x < end; ++x) {
+            target[((size_t)y * (size_t)outer_width + (size_t)x) * 4 + 3] = kTransparentResizeHitAlpha;
+        }
+    };
+    for (int y = 0; y < top; ++y) seed_span(y, 0, outer_width);
+    for (int y = top; y < bottom; ++y) {
+        seed_span(y, 0, left);
+        seed_span(y, right, outer_width);
+    }
+    for (int y = bottom; y < outer_height; ++y) seed_span(y, 0, outer_width);
+}
+
+/* Per-pixel-alpha presentation for transparent top-level windows.
+ * Layered windows do not compose child HWND redirection surfaces, so
+ * blend every visible canvas's premultiplied BGRA buffer into one
+ * outer-window DIB in native layer order and submit it atomically.
+ * This happens before a deferred first show, which makes the first
+ * visible frame both nonblank and alpha-correct. */
+static bool presentTransparentWindow(Host *host, Window &window) {
+    if (!host || !window.transparent || !window.hwnd) return false;
+    RECT outer = {};
+    if (!GetWindowRect(window.hwnd, &outer)) return false;
+    const int outer_width = outer.right - outer.left;
+    const int outer_height = outer.bottom - outer.top;
+    if (outer_width <= 0 || outer_height <= 0) return false;
+    RECT client = {};
+    if (!GetClientRect(window.hwnd, &client)) return false;
+    POINT client_origin = { client.left, client.top };
+    if (!ClientToScreen(window.hwnd, &client_origin)) return false;
+    const int client_left = client_origin.x - outer.left;
+    const int client_top = client_origin.y - outer.top;
+    const int client_right = client_left + (client.right - client.left);
+    const int client_bottom = client_top + (client.bottom - client.top);
+
+    BITMAPINFO target_info = {};
+    target_info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    target_info.bmiHeader.biWidth = outer_width;
+    target_info.bmiHeader.biHeight = -outer_height;
+    target_info.bmiHeader.biPlanes = 1;
+    target_info.bmiHeader.biBitCount = 32;
+    target_info.bmiHeader.biCompression = BI_RGB;
+    void *target_bits = nullptr;
+    HDC screen = GetDC(nullptr);
+    HDC memory = screen ? CreateCompatibleDC(screen) : nullptr;
+    HBITMAP bitmap = screen ? CreateDIBSection(screen, &target_info, DIB_RGB_COLORS, &target_bits, nullptr, 0) : nullptr;
+    if (!screen || !memory || !bitmap || !target_bits) {
+        if (bitmap) DeleteObject(bitmap);
+        if (memory) DeleteDC(memory);
+        if (screen) ReleaseDC(nullptr, screen);
+        return false;
+    }
+    memset(target_bits, 0, (size_t)outer_width * (size_t)outer_height * 4);
+    uint8_t *target = reinterpret_cast<uint8_t *>(target_bits);
+    if (window.resizable) {
+        seedTransparentResizeHitFrame(
+            target,
+            outer_width,
+            outer_height,
+            client_left,
+            client_top,
+            client_right,
+            client_bottom);
+    }
+
+    std::vector<NativeView *> surfaces;
+    for (auto &entry : host->native_views) {
+        NativeView &view = entry.second;
+        if (view.window_id != window.id || view.kind != kViewGpuSurface ||
+            !view.hwnd || !view.visible || view.gpu_bgra.empty()) continue;
+        surfaces.push_back(&view);
+    }
+    std::sort(surfaces.begin(), surfaces.end(), [](const NativeView *a, const NativeView *b) {
+        if (a->layer != b->layer) return a->layer < b->layer;
+        return a->creation_order < b->creation_order;
+    });
+
+    for (const NativeView *view : surfaces) {
+        RECT child = {};
+        if (!GetWindowRect(view->hwnd, &child)) continue;
+        const int child_width = child.right - child.left;
+        const int child_height = child.bottom - child.top;
+        if (child_width <= 0 || child_height <= 0) continue;
+        POINT child_origin = { child.left, child.top };
+        ScreenToClient(window.hwnd, &child_origin);
+        const int content_x = client_origin.x - outer.left + child_origin.x;
+        const int content_y = client_origin.y - outer.top + child_origin.y;
+
+        for (int y = 0; y < child_height; ++y) {
+            const int target_y = content_y + y;
+            if (target_y < 0 || target_y >= outer_height) continue;
+            const int source_y = (int)((int64_t)y * view->gpu_buf_height / child_height);
+            for (int x = 0; x < child_width; ++x) {
+                const int target_x = content_x + x;
+                if (target_x < 0 || target_x >= outer_width) continue;
+                const int source_x = (int)((int64_t)x * view->gpu_buf_width / child_width);
+                const size_t source_offset = ((size_t)source_y * (size_t)view->gpu_buf_width + (size_t)source_x) * 4;
+                const size_t target_offset = ((size_t)target_y * (size_t)outer_width + (size_t)target_x) * 4;
+                const uint8_t *source_pixel = view->gpu_bgra.data() + source_offset;
+                uint8_t *target_pixel = target + target_offset;
+                /* Premultiplied source-over: src + dst * (1 - src.a).
+                 * The channel sum is intrinsically <= 255 because both
+                 * inputs obey the premultiplied invariant. */
+                for (size_t channel = 0; channel < 4; channel++) {
+                    target_pixel[channel] = compositePremultipliedChannel(
+                        source_pixel[channel],
+                        source_pixel[3],
+                        target_pixel[channel]);
+                }
+            }
+        }
+    }
+
+    HGDIOBJ previous = SelectObject(memory, bitmap);
+    POINT destination = { outer.left, outer.top };
+    SIZE size = { outer_width, outer_height };
+    POINT source = { 0, 0 };
+    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    const BOOL updated = UpdateLayeredWindow(window.hwnd, screen, &destination, &size, memory, &source, 0, &blend, ULW_ALPHA);
+    SelectObject(memory, previous);
+    DeleteObject(bitmap);
+    DeleteDC(memory);
+    ReleaseDC(nullptr, screen);
+    return updated != FALSE;
+}
+
+static void showWindowImplicit(Window &window) {
+    if (!window.hwnd || window.shown) return;
+    ShowWindow(window.hwnd, window.activate_on_show ? SW_SHOW : SW_SHOWNOACTIVATE);
+    window.shown = true;
+    window.deferred_show_started_ms = 0;
+    UpdateWindow(window.hwnd);
+}
+
+static void showDeferredWindowIfDeadlinePassed(Window &window) {
+    if (!window.hwnd || window.shown || !window.show_on_first_present) return;
+    const ULONGLONG elapsed_ms = GetTickCount64() - window.deferred_show_started_ms;
+    if (elapsed_ms >= kDeferredShowDeadlineMs) showWindowImplicit(window);
+}
+
 /* Key names match shortcutKeyFromWParam (which mirrors the GTK/AppKit gpu
  * key set) plus the navigation keys the canvas text editor understands. */
 static std::string gpuSurfaceKeyName(WPARAM wparam) {
@@ -4873,6 +5070,8 @@ static LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wparam, LPARA
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(host));
     }
     Host *host = hostFromWindow(hwnd);
+    const Window *input_window = windowForHwnd(host, hwnd);
+    if (input_window && input_window->click_through && message == WM_NCHITTEST) return HTTRANSPARENT;
     /* Hidden-titlebar (custom frame) windows first: DwmDefWindowProc
      * gets FIRST CLAIM on every message — it owns the DWM-drawn caption
      * buttons over the extended frame (hit-test, hover wash, press), and
@@ -5179,6 +5378,12 @@ static LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wparam, LPARA
             if (host && handleAppTimerMessage(host, wparam)) return 0;
             if (host && handleAudioTimerMessage(host, wparam)) return 0;
             if (host && wparam == kFrameTimerId) {
+                for (auto &entry : host->windows) {
+                    if (entry.second.hwnd == hwnd) {
+                        showDeferredWindowIfDeadlinePassed(entry.second);
+                        break;
+                    }
+                }
                 for (auto &entry : host->windows) emit(host, entry.second, kFrame);
             }
             return 0;
@@ -5290,7 +5495,25 @@ static ATOM registerClass(Host *host) {
     return RegisterClassExW(&wc);
 }
 
+static DWORD windowExtendedStyle(const Window &window) {
+    DWORD style = 0;
+    /* WS_EX_TRANSPARENT passes input through to other processes only
+     * for a layered window. Click-through is orthogonal to per-pixel
+     * transparency, so an otherwise opaque click-through window still
+     * uses a layered surface whose constant alpha is fixed at 255 below. */
+    if (window.transparent || window.click_through) style |= WS_EX_LAYERED;
+    if (window.always_on_top) style |= WS_EX_TOPMOST;
+    if (window.click_through) style |= WS_EX_TRANSPARENT;
+    return style;
+}
+
 static bool createNativeWindow(Host *host, Window &window) {
+    /* UpdateLayeredWindow replaces the complete top-level image: Win32
+     * non-client chrome and HMENU pixels are not redirected into it.
+     * Canvas children have an explicit software composition path below,
+     * but accepting either kind of OS chrome would create an invisible
+     * titlebar/menu with live hit targets. */
+    if (window.transparent && (!windowIsChromeless(window) || !host->menus.empty())) return false;
     registerClass(host);
     std::wstring title = widen(window.title.empty() ? host->window_title : window.title);
     /* ALL titlebar styles keep the full overlapped frame. The hidden
@@ -5334,7 +5557,7 @@ static bool createNativeWindow(Host *host, Window &window) {
         outer_height = outer.cy;
     }
     HWND hwnd = CreateWindowExW(
-        0,
+        windowExtendedStyle(window),
         L"NativeSdkWindowsHost",
         title.c_str(),
         style,
@@ -5349,6 +5572,13 @@ static bool createNativeWindow(Host *host, Window &window) {
     if (!hwnd) return false;
     DragAcceptFiles(hwnd, TRUE);
     window.hwnd = hwnd;
+    window.deferred_show_started_ms = window.show_on_first_present ? GetTickCount64() : 0;
+    if (window.click_through && !window.transparent &&
+        !SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)) {
+        DestroyWindow(hwnd);
+        window.hwnd = nullptr;
+        return false;
+    }
     applyMenusToWindow(host, window);
     /* Before the first show, so a dark-scheme launch never flashes a
      * light caption. */
@@ -5361,8 +5591,17 @@ static bool createNativeWindow(Host *host, Window &window) {
          * `window` referencing the stored map entry for exactly this. */
         SetWindowPos(hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
-    ShowWindow(hwnd, SW_SHOW);
-    UpdateWindow(hwnd);
+    /* Initialize WS_EX_LAYERED through the same per-pixel path used by
+     * canvas presents. A layered HWND is otherwise not displayable until
+     * SetLayeredWindowAttributes or UpdateLayeredWindow has succeeded. */
+    if (window.transparent && !presentTransparentWindow(host, window)) {
+        DestroyWindow(hwnd);
+        window.hwnd = nullptr;
+        return false;
+    }
+    if (!window.show_on_first_present) {
+        showWindowImplicit(window);
+    }
     SetTimer(hwnd, kFrameTimerId, 16, nullptr);
     return true;
 }
@@ -5371,14 +5610,14 @@ static bool createNativeWindow(Host *host, Window &window) {
 
 extern "C" {
 
-void native_sdk_windows_load_window_webview(Host *host, uint64_t window_id, const char *source, size_t source_len, int source_kind, const char *asset_root, size_t asset_root_len, const char *asset_entry, size_t asset_entry_len, const char *asset_origin, size_t asset_origin_len, int spa_fallback);
+int native_sdk_windows_load_window_webview(Host *host, uint64_t window_id, const char *source, size_t source_len, int source_kind, const char *asset_root, size_t asset_root_len, const char *asset_entry, size_t asset_entry_len, const char *asset_origin, size_t asset_origin_len, int spa_fallback);
 void native_sdk_windows_bridge_respond_window(Host *host, uint64_t window_id, const char *response, size_t response_len);
 void native_sdk_windows_bridge_respond_webview(Host *host, uint64_t window_id, const char *webview_label, size_t webview_label_len, const char *response, size_t response_len);
 size_t native_sdk_windows_clipboard_read_data(Host *host, const char *mime_type, size_t mime_type_len, char *buffer, size_t buffer_len);
 int native_sdk_windows_clipboard_write_data(Host *host, const char *mime_type, size_t mime_type_len, const char *bytes, size_t bytes_len);
 void native_sdk_windows_cancel_timer(Host *host, uint64_t timer_id);
 
-Host *native_sdk_windows_create(const char *app_name, size_t app_name_len, const char *window_title, size_t window_title_len, const char *bundle_id, size_t bundle_id_len, const char *icon_path, size_t icon_path_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, double min_width, double min_height) {
+Host *native_sdk_windows_create(const char *app_name, size_t app_name_len, const char *window_title, size_t window_title_len, const char *bundle_id, size_t bundle_id_len, const char *icon_path, size_t icon_path_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, double min_width, double min_height, int show_policy, uint32_t window_flags) {
     (void)restore_frame;
     INITCOMMONCONTROLSEX controls = {};
     controls.dwSize = sizeof(controls);
@@ -5411,6 +5650,11 @@ Host *native_sdk_windows_create(const char *app_name, size_t app_name_len, const
     window.titlebar_style = titlebar_style;
     window.min_width = min_width;
     window.min_height = min_height;
+    window.transparent = (window_flags & (1u << 0)) != 0;
+    window.always_on_top = (window_flags & (1u << 1)) != 0;
+    window.click_through = (window_flags & (1u << 2)) != 0;
+    window.activate_on_show = (window_flags & (1u << 3)) == 0;
+    window.show_on_first_present = show_policy == 1;
     host->windows[window.id] = window;
     return host;
 }
@@ -5563,10 +5807,18 @@ int native_sdk_windows_decode_image(const uint8_t *bytes, size_t bytes_len, uint
 }
 
 void native_sdk_windows_load_webview(Host *host, const char *source, size_t source_len, int source_kind, const char *asset_root, size_t asset_root_len, const char *asset_entry, size_t asset_entry_len, const char *asset_origin, size_t asset_origin_len, int spa_fallback) {
-    native_sdk_windows_load_window_webview(host, 1, source, source_len, source_kind, asset_root, asset_root_len, asset_entry, asset_entry_len, asset_origin, asset_origin_len, spa_fallback);
+    (void)native_sdk_windows_load_window_webview(host, 1, source, source_len, source_kind, asset_root, asset_root_len, asset_entry, asset_entry_len, asset_origin, asset_origin_len, spa_fallback);
 }
 
-void native_sdk_windows_load_window_webview(Host *host, uint64_t window_id, const char *source, size_t source_len, int source_kind, const char *asset_root, size_t asset_root_len, const char *asset_entry, size_t asset_entry_len, const char *asset_origin, size_t asset_origin_len, int spa_fallback) {
+int native_sdk_windows_load_window_webview(Host *host, uint64_t window_id, const char *source, size_t source_len, int source_kind, const char *asset_root, size_t asset_root_len, const char *asset_entry, size_t asset_entry_len, const char *asset_origin, size_t asset_origin_len, int spa_fallback) {
+    if (!host) return 0;
+    auto window = host->windows.find(window_id);
+    if (window == host->windows.end() || !window->second.hwnd) return 0;
+    /* A child WebView cannot participate in UpdateLayeredWindow's
+     * top-level alpha bitmap. Preserve a distinct return so the Zig
+     * service reports UnsupportedWindowTransparency, not the generic
+     * CreateFailed used for an absent window. */
+    if (window->second.transparent) return -1;
 #if !NATIVE_SDK_HAS_WEBVIEW2
     (void)spa_fallback;
     (void)source;
@@ -5578,14 +5830,9 @@ void native_sdk_windows_load_window_webview(Host *host, uint64_t window_id, cons
     (void)asset_entry_len;
     (void)asset_origin;
     (void)asset_origin_len;
-    if (!host) return;
-    auto found = host->windows.find(window_id);
-    if (found != host->windows.end()) emit(host, found->second, kWindowFrame);
+    emit(host, window->second, kWindowFrame);
+    return 1;
 #else
-    if (!host) return;
-    auto window = host->windows.find(window_id);
-    if (window == host->windows.end() || !window->second.hwnd) return;
-
     std::string key = webViewKey(window_id, "main");
     auto found = host->webviews.find(key);
     if (found == host->webviews.end()) {
@@ -5604,7 +5851,7 @@ void native_sdk_windows_load_window_webview(Host *host, uint64_t window_id, cons
             nullptr,
             host->instance,
             nullptr);
-        if (!hwnd) return;
+        if (!hwnd) return 0;
 
         ChildWebView webview;
         webview.window_id = window_id;
@@ -5628,7 +5875,7 @@ void native_sdk_windows_load_window_webview(Host *host, uint64_t window_id, cons
         if (!createChildWebView(host, key)) {
             DestroyWindow(hwnd);
             host->webviews.erase(key);
-            return;
+            return 0;
         }
     }
 
@@ -5642,6 +5889,7 @@ void native_sdk_windows_load_window_webview(Host *host, uint64_t window_id, cons
     webview.spa_fallback = spa_fallback != 0;
     loadWebViewSource(webview);
     emit(host, window->second, kWindowFrame);
+    return 1;
 #endif
 }
 
@@ -5709,12 +5957,20 @@ void native_sdk_windows_set_security_policy(Host *host, const char *allowed_orig
     host->external_link_action = external_action;
 }
 
-void native_sdk_windows_set_menus(Host *host, const char *const *menu_titles, const size_t *menu_title_lens, size_t menu_count, const uint32_t *item_menu_indices, const char *const *item_labels, const size_t *item_label_lens, const char *const *item_commands, const size_t *item_command_lens, const char *const *item_keys, const size_t *item_key_lens, const uint32_t *item_modifiers, const int *item_separators, const int *item_enabled, const int *item_checked, size_t item_count) {
-    if (!host) return;
+int native_sdk_windows_set_menus(Host *host, const char *const *menu_titles, const size_t *menu_title_lens, size_t menu_count, const uint32_t *item_menu_indices, const char *const *item_labels, const size_t *item_label_lens, const char *const *item_commands, const size_t *item_command_lens, const char *const *item_keys, const size_t *item_key_lens, const uint32_t *item_modifiers, const int *item_separators, const int *item_enabled, const int *item_checked, size_t item_count) {
+    if (!host) return 0;
+    /* Menus may be configured after a runtime alpha window exists.
+     * Refuse the whole update before mutating the live menu model; an
+     * HMENU cannot be represented by that window's layered bitmap. */
+    if (menu_count > 0) {
+        for (const auto &entry : host->windows) {
+            if (entry.second.transparent) return 0;
+        }
+    }
     host->menus.clear();
     host->menu_commands.clear();
 
-    if (menu_count > 0 && (!menu_titles || !menu_title_lens)) return;
+    if (menu_count > 0 && (!menu_titles || !menu_title_lens)) return 0;
     host->menus.reserve(menu_count);
     for (size_t index = 0; index < menu_count; ++index) {
         Menu menu;
@@ -5722,7 +5978,7 @@ void native_sdk_windows_set_menus(Host *host, const char *const *menu_titles, co
         host->menus.push_back(menu);
     }
 
-    if (item_count > 0 && (!item_menu_indices || !item_labels || !item_label_lens || !item_commands || !item_command_lens || !item_keys || !item_key_lens || !item_modifiers || !item_separators || !item_enabled || !item_checked)) return;
+    if (item_count > 0 && (!item_menu_indices || !item_labels || !item_label_lens || !item_commands || !item_command_lens || !item_keys || !item_key_lens || !item_modifiers || !item_separators || !item_enabled || !item_checked)) return 0;
     uint32_t next_command_id = kMenuCommandBase;
     for (size_t index = 0; index < item_count; ++index) {
         uint32_t menu_index = item_menu_indices[index];
@@ -5748,6 +6004,7 @@ void native_sdk_windows_set_menus(Host *host, const char *const *menu_titles, co
     for (auto &entry : host->windows) {
         if (entry.second.hwnd) applyMenusToWindow(host, entry.second);
     }
+    return 1;
 }
 
 void native_sdk_windows_set_shortcuts(Host *host, const char *const *ids, const size_t *id_lens, const char *const *keys, const size_t *key_lens, const uint32_t *modifiers, size_t count) {
@@ -5768,7 +6025,7 @@ void native_sdk_windows_set_shortcuts(Host *host, const char *const *ids, const 
     }
 }
 
-int native_sdk_windows_create_window(Host *host, uint64_t window_id, const char *window_title, size_t window_title_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, double min_width, double min_height) {
+int native_sdk_windows_create_window(Host *host, uint64_t window_id, const char *window_title, size_t window_title_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, double min_width, double min_height, int show_policy, uint32_t window_flags) {
     (void)restore_frame;
     if (!host || host->windows.find(window_id) != host->windows.end()) return 0;
     Window window;
@@ -5783,6 +6040,11 @@ int native_sdk_windows_create_window(Host *host, uint64_t window_id, const char 
     window.titlebar_style = titlebar_style;
     window.min_width = min_width;
     window.min_height = min_height;
+    window.transparent = (window_flags & (1u << 0)) != 0;
+    window.always_on_top = (window_flags & (1u << 1)) != 0;
+    window.click_through = (window_flags & (1u << 2)) != 0;
+    window.activate_on_show = (window_flags & (1u << 3)) == 0;
+    window.show_on_first_present = show_policy == 1;
     /* Register BEFORE creating: createNativeWindow's post-create frame
      * pass (hidden titlebar styles) resolves the window through the map
      * by HWND, so the stored entry must be the one it mutates. */
@@ -5930,6 +6192,11 @@ int native_sdk_windows_focus_window(Host *host, uint64_t window_id) {
     if (!host) return 0;
     auto found = host->windows.find(window_id);
     if (found == host->windows.end() || !found->second.hwnd) return 0;
+    if (!found->second.shown) {
+        ShowWindow(found->second.hwnd, SW_SHOW);
+        found->second.shown = true;
+    }
+    found->second.deferred_show_started_ms = 0;
     SetForegroundWindow(found->second.hwnd);
     SetFocus(found->second.hwnd);
     return 1;
@@ -5964,7 +6231,15 @@ int native_sdk_windows_show_window(Host *host, uint64_t window_id) {
     auto found = host->windows.find(window_id);
     if (found == host->windows.end() || !found->second.hwnd) return 0;
     found->second.policy_hidden = false;
-    ShowWindow(found->second.hwnd, IsIconic(found->second.hwnd) ? SW_RESTORE : SW_SHOW);
+    if (found->second.activate_on_show) {
+        ShowWindow(found->second.hwnd, IsIconic(found->second.hwnd) ? SW_RESTORE : SW_SHOW);
+        SetForegroundWindow(found->second.hwnd);
+        SetFocus(found->second.hwnd);
+    } else {
+        ShowWindow(found->second.hwnd, SW_SHOWNOACTIVATE);
+    }
+    found->second.shown = true;
+    found->second.deferred_show_started_ms = 0;
     /* Re-show returns full frame cadence without dropping a beat, the
      * same supersede the top-level WM_SIZE handler runs on restore:
      * SW_SHOW on a same-size window dispatches no WM_SIZE, so a
@@ -5980,8 +6255,6 @@ int native_sdk_windows_show_window(Host *host, uint64_t window_id) {
         surface.gpu_emission_scheduled = false;
         gpuSurfaceScheduleFrameEmission(host, surface);
     }
-    SetForegroundWindow(found->second.hwnd);
-    SetFocus(found->second.hwnd);
     emit(host, found->second, kWindowFrame);
     return 1;
 }
@@ -6001,6 +6274,11 @@ int native_sdk_windows_create_view(Host *host, uint64_t window_id, const char *l
     if (!host || label_len == 0 || !isSupportedNativeViewKind(kind) || !validNativeViewFrame(x, y, width, height)) return 0;
     auto window = host->windows.find(window_id);
     if (window == host->windows.end() || !window->second.hwnd) return 0;
+    /* UpdateLayeredWindow owns the complete top-level bitmap and cannot
+     * redirect ordinary child HWNDs into it. Canvas surfaces are composed
+     * explicitly by presentTransparentWindow; reject every other native
+     * kind instead of accepting content Windows would leave invisible. */
+    if (window->second.transparent && kind != kViewGpuSurface) return 0;
 
     std::string label_string = slice(label, label_len);
     std::string key = nativeViewKey(window_id, label_string);
@@ -6130,7 +6408,7 @@ int native_sdk_windows_create_view(Host *host, uint64_t window_id, const char *l
          * after the first present; see the frame-scheduler comments). */
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(host));
         SetTimer(hwnd, kGpuFrameTimerId, 16, nullptr);
-        SetFocus(hwnd);
+        if (window->second.activate_on_show) SetFocus(hwnd);
     }
     return 1;
 }
@@ -6214,6 +6492,8 @@ int native_sdk_windows_present_gpu_surface_pixels(Host *host, uint64_t window_id
     if (width > INT_MAX || height > INT_MAX) return 0;
     if (rgba8_len != width * height * 4) return 0;
     NativeView &view = found->second;
+    auto owner = host->windows.find(view.window_id);
+    const bool transparent_window = owner != host->windows.end() && owner->second.transparent;
 
     /* Straight RGBA8 -> top-down BGRA rows for a BI_RGB 32bpp DIB. The
      * surface is opaque (alpha_mode "opaque"), so no premultiply is
@@ -6228,17 +6508,17 @@ int native_sdk_windows_present_gpu_surface_pixels(Host *host, uint64_t window_id
     const size_t pixel_count = width * height;
     for (size_t index = 0; index < pixel_count; index++) {
         const uint8_t *src = rgba8 + index * 4;
-        dst[index * 4 + 0] = src[2];
-        dst[index * 4 + 1] = src[1];
-        dst[index * 4 + 2] = src[0];
-        dst[index * 4 + 3] = 255;
+        const uint32_t alpha = transparent_window ? src[3] : 255;
+        dst[index * 4 + 0] = transparent_window ? (uint8_t)((src[2] * alpha + 127) / 255) : src[2];
+        dst[index * 4 + 1] = transparent_window ? (uint8_t)((src[1] * alpha + 127) / 255) : src[1];
+        dst[index * 4 + 2] = transparent_window ? (uint8_t)((src[0] * alpha + 127) / 255) : src[0];
+        dst[index * 4 + 3] = (uint8_t)alpha;
     }
     view.gpu_buf_width = (int)width;
     view.gpu_buf_height = (int)height;
 
     /* Hidden-titlebar windows: keep the DWM caption material behind the
      * button cluster matched to the header the app just presented. */
-    auto owner = host->windows.find(view.window_id);
     if (owner != host->windows.end()) syncHiddenCaptionColor(host, owner->second, view, rgba8, width, height);
 
     const size_t sample_index = ((height / 2) * width + width / 2) * 4;
@@ -6251,7 +6531,8 @@ int native_sdk_windows_present_gpu_surface_pixels(Host *host, uint64_t window_id
         view.gpu_sample_color = ((uint32_t)sa << 24) | ((uint32_t)sr << 16) | ((uint32_t)sg << 8) | (uint32_t)sb;
     }
 
-    InvalidateRect(view.hwnd, nullptr, FALSE);
+    const bool layered_presented = owner != host->windows.end() && presentTransparentWindow(host, owner->second);
+    if (!layered_presented) InvalidateRect(view.hwnd, nullptr, FALSE);
     /* A present is the completion producer on the surface's single
      * frame-event scheduler: the completion event it arms is what
      * drives the runtime's frame loop (an armed animation presents,
@@ -6262,6 +6543,13 @@ int native_sdk_windows_present_gpu_surface_pixels(Host *host, uint64_t window_id
      * presents keep the heartbeat — they ARE the spin being throttled. */
     const bool first_present = !view.gpu_presented;
     view.gpu_presented = true;
+    /* Transparent windows reveal only after the outer alpha bitmap was
+     * accepted. A failed UpdateLayeredWindow can recover on a later
+     * present; the deadline remains the final safety net. */
+    if (owner != host->windows.end() && !owner->second.shown &&
+        (!owner->second.transparent || layered_presented)) {
+        showWindowImplicit(owner->second);
+    }
     if (first_present) view.gpu_prompt_frame_pending = true;
     gpuSurfaceScheduleFrameEmission(host, view);
     return 1;
@@ -6298,6 +6586,12 @@ int native_sdk_windows_update_view(Host *host, uint64_t window_id, const char *l
     std::string display_text = has_text ? view.text : nativeViewDisplayText(view);
     if (has_visible || has_enabled || has_role || has_accessibility_label || update_text) applyNativeViewState(view, update_text, display_text);
     if (has_layer) reorderWindowChildren(host, window_id);
+    if (view.kind == kViewGpuSurface && (has_frame || has_layer || has_visible)) {
+        auto window = host->windows.find(window_id);
+        if (window != host->windows.end() && window->second.transparent) {
+            (void)presentTransparentWindow(host, window->second);
+        }
+    }
     return 1;
 }
 
@@ -6336,6 +6630,10 @@ int native_sdk_windows_close_view(Host *host, uint64_t window_id, const char *la
     if (host->native_views.find(key) == host->native_views.end()) return 0;
     destroyNativeViewAndChildren(host, key);
     reorderWindowChildren(host, window_id);
+    auto window = host->windows.find(window_id);
+    if (window != host->windows.end() && window->second.transparent) {
+        (void)presentTransparentWindow(host, window->second);
+    }
     return 1;
 }
 
@@ -6685,6 +6983,7 @@ int native_sdk_windows_create_webview(Host *host, uint64_t window_id, const char
     if (!host || label_len == 0 || url_len == 0 || !validChildWebViewFrame(x, y, width, height)) return 0;
     auto window = host->windows.find(window_id);
     if (window == host->windows.end() || !window->second.hwnd) return 0;
+    if (window->second.transparent) return 0;
     std::string label_string = slice(label, label_len);
     std::string key = webViewKey(window_id, label_string);
     if (host->webviews.find(key) != host->webviews.end()) return 0;

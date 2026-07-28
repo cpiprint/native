@@ -24,6 +24,15 @@ pub fn RuntimeWindowStorage(comptime Runtime: type) type {
         const Self = @This();
 
         pub fn createWindow(self: *Runtime, options: platform.WindowCreateOptions) anyerror!platform.WindowInfo {
+            // A transparent imperative window with no EXPLICIT source is
+            // the canvas-overlay shape. Do not inherit the app's loaded
+            // WebView source: Windows layered windows cannot host that
+            // child HWND, and hot reload must not materialize one later.
+            // Explicit sources keep the established WebView-window path
+            // on backends that can composite them.
+            if (options.transparent and options.source == null) {
+                return Self.createWindowWithSourceMode(self, options, false, .never_source);
+            }
             return Self.createWindowWithSourceMode(self, options, options.source == null, .require_source);
         }
 
@@ -97,7 +106,8 @@ pub fn RuntimeWindowStorage(comptime Runtime: type) type {
             }
             if (Self.findWindowIndexById(self, id) != null) return error.DuplicateWindowId;
             if (Self.findWindowIndexByLabel(self, label) != null) return error.DuplicateWindowLabel;
-            const index = try Self.reserveWindow(self, id, label, options.title, source, source_reloads_from_app);
+            const index = try Self.reserveWindow(self, id, label, options.title, source, source_reloads_from_app, source_policy);
+            self.windows[index].activate_on_show = options.activate_on_show;
             var native_created = false;
             errdefer Self.removeWindowAt(self, index);
             errdefer if (native_created) self.options.platform.services.closeWindow(id) catch {};
@@ -118,7 +128,7 @@ pub fn RuntimeWindowStorage(comptime Runtime: type) type {
             return self.windows[index].info;
         }
 
-        pub fn reserveWindow(self: *Runtime, id: platform.WindowId, label: []const u8, title: []const u8, source: ?platform.WebViewSource, source_reloads_from_app: bool) !usize {
+        pub fn reserveWindow(self: *Runtime, id: platform.WindowId, label: []const u8, title: []const u8, source: ?platform.WebViewSource, source_reloads_from_app: bool, source_policy: WindowSourcePolicy) !usize {
             if (self.window_count >= platform.max_windows) return error.WindowLimitReached;
             if (label.len == 0) return error.InvalidWindowOptions;
             const index = self.window_count;
@@ -135,6 +145,7 @@ pub fn RuntimeWindowStorage(comptime Runtime: type) type {
             self.windows[index].main_view_id = Self.allocateViewId(self);
             self.windows[index].source = if (source) |source_value| try Self.copySource(self, index, source_value) else null;
             self.windows[index].source_reloads_from_app = source_reloads_from_app;
+            self.windows[index].source_policy = source_policy;
             self.windows[index].main_frame = geometry.RectF.init(0, 0, self.windows[index].info.frame.width, self.windows[index].info.frame.height);
             self.windows[index].main_frame_set = false;
             self.windows[index].main_layer = 0;
@@ -178,7 +189,7 @@ pub fn RuntimeWindowStorage(comptime Runtime: type) type {
 
         pub fn updateWindowState(self: *Runtime, state: platform.WindowState) !void {
             const existing_index = Self.findWindowIndexById(self, state.id);
-            const index = existing_index orelse try Self.reserveWindow(self, state.id, state.label, state.title, null, true);
+            const index = existing_index orelse try Self.reserveWindow(self, state.id, state.label, state.title, null, true, .allow_source_less);
             self.windows[index].info.frame = state.frame;
             self.windows[index].info.scale_factor = state.scale_factor;
             self.windows[index].info.open = state.open;

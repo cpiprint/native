@@ -10,6 +10,7 @@ pub const Error = error{
     FocusFailed,
     CloseFailed,
     UnsupportedWindowClosePolicy,
+    UnsupportedWindowTransparency,
 };
 
 const WindowsHost = opaque {};
@@ -120,7 +121,7 @@ const shortcut_modifier_control: u32 = 1 << 2;
 const shortcut_modifier_option: u32 = 1 << 3;
 const shortcut_modifier_shift: u32 = 1 << 4;
 
-extern fn native_sdk_windows_create(app_name: [*]const u8, app_name_len: usize, window_title: [*]const u8, window_title_len: usize, bundle_id: [*]const u8, bundle_id_len: usize, icon_path: [*]const u8, icon_path_len: usize, window_label: [*]const u8, window_label_len: usize, x: f64, y: f64, width: f64, height: f64, restore_frame: c_int, resizable: c_int, titlebar_style: c_int, min_width: f64, min_height: f64) ?*WindowsHost;
+extern fn native_sdk_windows_create(app_name: [*]const u8, app_name_len: usize, window_title: [*]const u8, window_title_len: usize, bundle_id: [*]const u8, bundle_id_len: usize, icon_path: [*]const u8, icon_path_len: usize, window_label: [*]const u8, window_label_len: usize, x: f64, y: f64, width: f64, height: f64, restore_frame: c_int, resizable: c_int, titlebar_style: c_int, min_width: f64, min_height: f64, show_policy: c_int, window_flags: u32) ?*WindowsHost;
 extern fn native_sdk_windows_destroy(host: *WindowsHost) void;
 extern fn native_sdk_windows_run(host: *WindowsHost, callback: WindowsCallback, context: ?*anyopaque) void;
 extern fn native_sdk_windows_stop(host: *WindowsHost) void;
@@ -128,16 +129,16 @@ extern fn native_sdk_windows_wake(host: *WindowsHost) void;
 extern fn native_sdk_windows_request_frame(host: *WindowsHost) void;
 extern fn native_sdk_windows_decode_image(bytes: [*]const u8, bytes_len: usize, pixels: [*]u8, pixels_len: usize, out_width: *usize, out_height: *usize) c_int;
 extern fn native_sdk_windows_load_webview(host: *WindowsHost, source: [*]const u8, source_len: usize, source_kind: c_int, asset_root: [*]const u8, asset_root_len: usize, asset_entry: [*]const u8, asset_entry_len: usize, asset_origin: [*]const u8, asset_origin_len: usize, spa_fallback: c_int) void;
-extern fn native_sdk_windows_load_window_webview(host: *WindowsHost, window_id: u64, source: [*]const u8, source_len: usize, source_kind: c_int, asset_root: [*]const u8, asset_root_len: usize, asset_entry: [*]const u8, asset_entry_len: usize, asset_origin: [*]const u8, asset_origin_len: usize, spa_fallback: c_int) void;
+extern fn native_sdk_windows_load_window_webview(host: *WindowsHost, window_id: u64, source: [*]const u8, source_len: usize, source_kind: c_int, asset_root: [*]const u8, asset_root_len: usize, asset_entry: [*]const u8, asset_entry_len: usize, asset_origin: [*]const u8, asset_origin_len: usize, spa_fallback: c_int) c_int;
 extern fn native_sdk_windows_set_bridge_callback(host: *WindowsHost, callback: WindowsBridgeCallback, context: ?*anyopaque) void;
 extern fn native_sdk_windows_bridge_respond(host: *WindowsHost, response: [*]const u8, response_len: usize) void;
 extern fn native_sdk_windows_bridge_respond_window(host: *WindowsHost, window_id: u64, response: [*]const u8, response_len: usize) void;
 extern fn native_sdk_windows_bridge_respond_webview(host: *WindowsHost, window_id: u64, webview_label: [*]const u8, webview_label_len: usize, response: [*]const u8, response_len: usize) void;
 extern fn native_sdk_windows_emit_window_event(host: *WindowsHost, window_id: u64, name: [*]const u8, name_len: usize, detail_json: [*]const u8, detail_json_len: usize) void;
 extern fn native_sdk_windows_set_security_policy(host: *WindowsHost, allowed_origins: [*]const u8, allowed_origins_len: usize, external_urls: [*]const u8, external_urls_len: usize, external_action: c_int) void;
-extern fn native_sdk_windows_set_menus(host: *WindowsHost, menu_titles: [*]const [*]const u8, menu_title_lens: [*]const usize, menu_count: usize, item_menu_indices: [*]const u32, item_labels: [*]const [*]const u8, item_label_lens: [*]const usize, item_commands: [*]const [*]const u8, item_command_lens: [*]const usize, item_keys: [*]const [*]const u8, item_key_lens: [*]const usize, item_modifiers: [*]const u32, item_separators: [*]const c_int, item_enabled: [*]const c_int, item_checked: [*]const c_int, item_count: usize) void;
+extern fn native_sdk_windows_set_menus(host: *WindowsHost, menu_titles: [*]const [*]const u8, menu_title_lens: [*]const usize, menu_count: usize, item_menu_indices: [*]const u32, item_labels: [*]const [*]const u8, item_label_lens: [*]const usize, item_commands: [*]const [*]const u8, item_command_lens: [*]const usize, item_keys: [*]const [*]const u8, item_key_lens: [*]const usize, item_modifiers: [*]const u32, item_separators: [*]const c_int, item_enabled: [*]const c_int, item_checked: [*]const c_int, item_count: usize) c_int;
 extern fn native_sdk_windows_set_shortcuts(host: *WindowsHost, ids: [*]const [*]const u8, id_lens: [*]const usize, keys: [*]const [*]const u8, key_lens: [*]const usize, modifiers: [*]const u32, count: usize) void;
-extern fn native_sdk_windows_create_window(host: *WindowsHost, window_id: u64, window_title: [*]const u8, window_title_len: usize, window_label: [*]const u8, window_label_len: usize, x: f64, y: f64, width: f64, height: f64, restore_frame: c_int, resizable: c_int, titlebar_style: c_int, min_width: f64, min_height: f64) c_int;
+extern fn native_sdk_windows_create_window(host: *WindowsHost, window_id: u64, window_title: [*]const u8, window_title_len: usize, window_label: [*]const u8, window_label_len: usize, x: f64, y: f64, width: f64, height: f64, restore_frame: c_int, resizable: c_int, titlebar_style: c_int, min_width: f64, min_height: f64, show_policy: c_int, window_flags: u32) c_int;
 extern fn native_sdk_windows_start_window_drag(host: *WindowsHost, window_id: u64) c_int;
 extern fn native_sdk_windows_set_window_drag_regions(host: *WindowsHost, window_id: u64, label: [*]const u8, label_len: usize, rects: [*]const f64, exclusions: [*]const c_int, count: usize) c_int;
 extern fn native_sdk_windows_window_chrome(host: *WindowsHost, window_id: u64, top: *f64, left: *f64, bottom: *f64, right: *f64, buttons_x: *f64, buttons_y: *f64, buttons_width: *f64, buttons_height: *f64) c_int;
@@ -261,12 +262,30 @@ fn refuseUnsupportedMainWindowClosePolicy(app_info: platform_mod.AppInfo) Error!
     return error.UnsupportedWindowClosePolicy;
 }
 
+/// A Win32 per-pixel-alpha window is painted as one top-level layered
+/// bitmap: child HWNDs and non-client chrome do not participate in that
+/// bitmap. Canvas children are redirected explicitly by the host, but
+/// standard/hidden titlebars and an HMENU would otherwise be silently
+/// erased by the transparent DIB. Keep that limitation explicit at the
+/// create/configure seams instead of accepting an unusable combination.
+fn refuseUnsupportedTransparentWindow(options: platform_mod.WindowOptions, menus_active: bool) Error!void {
+    if (!options.transparent) return;
+    if (options.titlebar != .chromeless or menus_active) {
+        std.debug.print("transparent windows on windows require titlebar = \"chromeless\" and cannot be combined with application menus because Win32 layered windows cannot composite non-client chrome\n", .{});
+        return error.UnsupportedWindowTransparency;
+    }
+}
+
 pub const WindowsPlatform = struct {
     host: *WindowsHost,
     web_engine: platform_mod.WebEngine,
     app_info: platform_mod.AppInfo,
     surface_value: platform_mod.Surface,
     state: RunState = .{},
+    /// Mirrors the successfully installed native menu model so a
+    /// later runtime-created alpha window can fail with the precise
+    /// transparency error before crossing the C ABI.
+    menus_active: bool = false,
     /// Latched when the runtime's effects teardown abandons an
     /// in-flight channel `wake_fn` call (see
     /// `PlatformServices.note_channel_wake_abandoned_fn`): the stale
@@ -298,9 +317,10 @@ pub const WindowsPlatform = struct {
         // taskbar entry and windows has no dock-reopen path, so a
         // declared tray (status item) is the ONLY re-show affordance.
         try refuseUnsupportedMainWindowClosePolicy(app_info);
+        try refuseUnsupportedTransparentWindow(window_options, false);
         const window_title = window_options.resolvedTitle(app_info.app_name);
         const frame = window_options.default_frame;
-        const host = native_sdk_windows_create(app_info.app_name.ptr, app_info.app_name.len, window_title.ptr, window_title.len, app_info.bundle_id.ptr, app_info.bundle_id.len, app_info.icon_path.ptr, app_info.icon_path.len, window_options.label.ptr, window_options.label.len, frame.x, frame.y, frame.width, frame.height, if (window_options.restore_state) 1 else 0, if (window_options.resizable) 1 else 0, titlebarStyleInt(window_options.titlebar), minSizeFloor(window_options.min_width), minSizeFloor(window_options.min_height)) orelse return error.CreateFailed;
+        const host = native_sdk_windows_create(app_info.app_name.ptr, app_info.app_name.len, window_title.ptr, window_title.len, app_info.bundle_id.ptr, app_info.bundle_id.len, app_info.icon_path.ptr, app_info.icon_path.len, window_options.label.ptr, window_options.label.len, frame.x, frame.y, frame.width, frame.height, if (window_options.restore_state) 1 else 0, if (window_options.resizable) 1 else 0, titlebarStyleInt(window_options.titlebar), minSizeFloor(window_options.min_width), minSizeFloor(window_options.min_height), showModeInt(window_options.show), windowFlags(window_options)) orelse return error.CreateFailed;
         // The manifest's declared close policy rides right after the
         // create, like the min-size floor: close handling is host
         // window state fixed for the window's life.
@@ -758,7 +778,7 @@ fn loadWebView(context: ?*anyopaque, source: platform_mod.WebViewSource) anyerro
 fn loadWindowWebView(context: ?*anyopaque, window_id: platform_mod.WindowId, source: platform_mod.WebViewSource) anyerror!void {
     const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
     const assets: platform_mod.WebViewAssetSource = source.asset_options orelse .{ .root_path = "", .entry = "", .origin = "", .spa_fallback = false };
-    native_sdk_windows_load_window_webview(
+    const result = native_sdk_windows_load_window_webview(
         self.host,
         window_id,
         source.bytes.ptr,
@@ -776,6 +796,8 @@ fn loadWindowWebView(context: ?*anyopaque, window_id: platform_mod.WindowId, sou
         assets.origin.len,
         if (assets.spa_fallback) 1 else 0,
     );
+    if (result < 0) return error.UnsupportedWindowTransparency;
+    if (result == 0) return error.CreateFailed;
 }
 
 fn completeBridge(context: ?*anyopaque, response: []const u8) anyerror!void {
@@ -856,6 +878,22 @@ fn titlebarStyleInt(style: platform_mod.WindowTitlebarStyle) c_int {
     };
 }
 
+fn showModeInt(mode: platform_mod.WindowShowMode) c_int {
+    return switch (mode) {
+        .immediate => 0,
+        .on_first_present => 1,
+    };
+}
+
+fn windowFlags(options: platform_mod.WindowOptions) u32 {
+    var flags: u32 = 0;
+    if (options.transparent) flags |= 1 << 0;
+    if (options.always_on_top) flags |= 1 << 1;
+    if (options.click_through) flags |= 1 << 2;
+    if (!options.activate_on_show) flags |= 1 << 3;
+    return flags;
+}
+
 /// Zero/negative/non-finite floors are the "no floor" sentinel (the
 /// host leaves that axis at its natural minimum).
 fn closePolicyInt(policy: platform_mod.WindowClosePolicy) c_int {
@@ -878,9 +916,10 @@ fn minSizeFloor(value: f32) f64 {
 
 fn createWindow(context: ?*anyopaque, options: platform_mod.WindowOptions) anyerror!platform_mod.WindowInfo {
     const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
+    try refuseUnsupportedTransparentWindow(options, self.menus_active);
     const title = options.resolvedTitle(self.app_info.app_name);
     const frame = options.default_frame;
-    if (native_sdk_windows_create_window(self.host, options.id, title.ptr, title.len, options.label.ptr, options.label.len, frame.x, frame.y, frame.width, frame.height, if (options.restore_state) 1 else 0, if (options.resizable) 1 else 0, titlebarStyleInt(options.titlebar), minSizeFloor(options.min_width), minSizeFloor(options.min_height)) == 0) return error.CreateFailed;
+    if (native_sdk_windows_create_window(self.host, options.id, title.ptr, title.len, options.label.ptr, options.label.len, frame.x, frame.y, frame.width, frame.height, if (options.restore_state) 1 else 0, if (options.resizable) 1 else 0, titlebarStyleInt(options.titlebar), minSizeFloor(options.min_width), minSizeFloor(options.min_height), showModeInt(options.show), windowFlags(options)) == 0) return error.CreateFailed;
     applyWindowClosePolicy(self.host, options.id, options.close_policy);
     return .{
         .id = options.id,
@@ -889,7 +928,7 @@ fn createWindow(context: ?*anyopaque, options: platform_mod.WindowOptions) anyer
         .frame = frame,
         .scale_factor = 1,
         .open = true,
-        .focused = false,
+        .focused = options.activate_on_show and options.show == .immediate,
     };
 }
 
@@ -1535,7 +1574,7 @@ fn configureMenus(context: ?*anyopaque, menus: []const platform_mod.Menu) anyerr
         }
     }
 
-    native_sdk_windows_set_menus(
+    if (native_sdk_windows_set_menus(
         self.host,
         menu_titles[0..menus.len].ptr,
         menu_title_lens[0..menus.len].ptr,
@@ -1552,7 +1591,8 @@ fn configureMenus(context: ?*anyopaque, menus: []const platform_mod.Menu) anyerr
         item_enabled[0..item_count].ptr,
         item_checked[0..item_count].ptr,
         item_count,
-    );
+    ) == 0) return error.UnsupportedWindowTransparency;
+    self.menus_active = menus.len > 0;
 }
 
 fn configureShortcuts(context: ?*anyopaque, shortcuts: []const platform_mod.Shortcut) anyerror!void {
@@ -1842,6 +1882,176 @@ test "windows WM_CLOSE hide consults the live tray state and downgrades to a rea
     // The consult sits INSIDE the close hook, BEFORE the hide.
     try std.testing.expect(consult_at.? < hide_at.?);
     try std.testing.expect(std.mem.indexOf(u8, close_hook, "downgraded to a real close") != null);
+}
+
+test "windows passive show never foregrounds or focuses the window" {
+    const host_source = @embedFile("webview2_host.cpp");
+    const show_at = std.mem.indexOf(u8, host_source, "int native_sdk_windows_show_window(") orelse return error.TestExpectedEqual;
+    const tail = host_source[show_at..];
+    const next_at = std.mem.indexOf(u8, tail, "int native_sdk_windows_set_window_close_policy(") orelse return error.TestExpectedEqual;
+    const show_fn = tail[0..next_at];
+    const passive_at = std.mem.indexOf(u8, show_fn, "ShowWindow(found->second.hwnd, SW_SHOWNOACTIVATE);") orelse return error.TestExpectedEqual;
+    const focused_at = std.mem.indexOf(u8, show_fn, "SetFocus(found->second.hwnd);") orelse return error.TestExpectedEqual;
+    const active_branch_end = std.mem.indexOfPos(u8, show_fn, focused_at, "} else {") orelse return error.TestExpectedEqual;
+    try std.testing.expect(focused_at < active_branch_end);
+    try std.testing.expect(std.mem.indexOfPos(u8, show_fn, passive_at, "SetForegroundWindow(") == null);
+    try std.testing.expect(std.mem.indexOfPos(u8, show_fn, passive_at, "SetFocus(") == null);
+
+    // Passive is a SHOW policy, not a permanent interaction policy:
+    // WS_EX_NOACTIVATE would also suppress activation on a later user
+    // click, making an interactive passive overlay impossible to focus.
+    const style_at = std.mem.indexOf(u8, host_source, "static DWORD windowExtendedStyle(") orelse return error.TestExpectedEqual;
+    const style_tail = host_source[style_at..];
+    const style_end = std.mem.indexOf(u8, style_tail, "static bool createNativeWindow(") orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, style_tail[0..style_end], "WS_EX_NOACTIVATE") == null);
+}
+
+test "windows passive canvas creation does not focus its child hwnd" {
+    const host_source = @embedFile("webview2_host.cpp");
+    const create_at = std.mem.indexOf(u8, host_source, "int native_sdk_windows_create_view(") orelse return error.TestExpectedEqual;
+    const tail = host_source[create_at..];
+    const next_at = std.mem.indexOf(u8, tail, "int native_sdk_windows_request_gpu_surface_frame(") orelse return error.TestExpectedEqual;
+    const create_fn = tail[0..next_at];
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        create_fn,
+        "if (window->second.activate_on_show) SetFocus(hwnd);",
+    ) != null);
+}
+
+test "windows click-through uses a layered surface even when visually opaque" {
+    const host_source = @embedFile("webview2_host.cpp");
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        host_source,
+        "if (window.transparent || window.click_through) style |= WS_EX_LAYERED;",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        host_source,
+        "if (window.click_through && !window.transparent &&\n        !SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA))",
+    ) != null);
+}
+
+test "windows transparent windows compose canvas siblings and reject unredirectable children" {
+    const host_source = @embedFile("webview2_host.cpp");
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        host_source,
+        "static bool presentTransparentWindow(Host *host, Window &window)",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        host_source,
+        "std::sort(surfaces.begin(), surfaces.end()",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        host_source,
+        "compositePremultipliedChannel(128, 128, 64) == 160",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        host_source,
+        "if (window->second.transparent && kind != kViewGpuSurface) return 0;",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        host_source,
+        "if (window->second.transparent) return 0;",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        host_source,
+        "if (window->second.transparent) return -1;",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        host_source,
+        "if (window.transparent && (!windowIsChromeless(window) || !host->menus.empty())) return false;",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        host_source,
+        "if (menu_count > 0) {\n        for (const auto &entry : host->windows) {\n            if (entry.second.transparent) return 0;",
+    ) != null);
+}
+
+test "windows transparent resize frame remains hit-testable without filling the client" {
+    const host_source = @embedFile("webview2_host.cpp");
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        host_source,
+        "static constexpr uint8_t kTransparentResizeHitAlpha = 1;",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        host_source,
+        "outsideTransparentClientBounds(6, 100, 7, 7, 713, 513)",
+    ) != null);
+    const present_at = std.mem.indexOf(
+        u8,
+        host_source,
+        "static bool presentTransparentWindow(Host *host, Window &window)",
+    ) orelse return error.TestExpectedEqual;
+    const present = host_source[present_at..];
+    const seed_at = std.mem.indexOf(
+        u8,
+        present,
+        "if (window.resizable) {\n        seedTransparentResizeHitFrame(",
+    ) orelse return error.TestExpectedEqual;
+    const surfaces_at = std.mem.indexOf(
+        u8,
+        present,
+        "std::vector<NativeView *> surfaces;",
+    ) orelse return error.TestExpectedEqual;
+    try std.testing.expect(seed_at < surfaces_at);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        present,
+        "if (input_window && input_window->click_through && message == WM_NCHITTEST) return HTTRANSPARENT;",
+    ) != null);
+}
+
+test "windows transparent windows require chromeless chrome and no menus" {
+    try refuseUnsupportedTransparentWindow(.{
+        .titlebar = .chromeless,
+        .transparent = true,
+    }, false);
+    try std.testing.expectError(error.UnsupportedWindowTransparency, refuseUnsupportedTransparentWindow(.{
+        .titlebar = .standard,
+        .transparent = true,
+    }, false));
+    try std.testing.expectError(error.UnsupportedWindowTransparency, refuseUnsupportedTransparentWindow(.{
+        .titlebar = .hidden_inset,
+        .transparent = true,
+    }, false));
+    try std.testing.expectError(error.UnsupportedWindowTransparency, refuseUnsupportedTransparentWindow(.{
+        .titlebar = .chromeless,
+        .transparent = true,
+    }, true));
+    // The constraint is only about per-pixel alpha: ordinary menu
+    // windows keep every titlebar style.
+    try refuseUnsupportedTransparentWindow(.{}, true);
+}
+
+test "windows first-present windows have a fallback reveal deadline" {
+    const host_source = @embedFile("webview2_host.cpp");
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        host_source,
+        "constexpr ULONGLONG kDeferredShowDeadlineMs = 1000;",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        host_source,
+        "showDeferredWindowIfDeadlinePassed(entry.second);",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        host_source,
+        "window.deferred_show_started_ms = window.show_on_first_present ? GetTickCount64() : 0;",
+    ) != null);
 }
 
 test "windows window focus includes focused native child views" {

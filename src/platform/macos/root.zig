@@ -13,6 +13,7 @@ pub const Error = error{
     CreateFailed,
     FocusFailed,
     CloseFailed,
+    UnsupportedWindowTransparency,
 };
 
 const AppKitHost = opaque {};
@@ -155,7 +156,7 @@ const shortcut_modifier_control: u32 = 1 << 2;
 const shortcut_modifier_option: u32 = 1 << 3;
 const shortcut_modifier_shift: u32 = 1 << 4;
 
-extern fn native_sdk_appkit_create(app_name: [*]const u8, app_name_len: usize, display_name: [*]const u8, display_name_len: usize, version: [*]const u8, version_len: usize, about_description: [*]const u8, about_description_len: usize, has_web_content: c_int, window_title: [*]const u8, window_title_len: usize, bundle_id: [*]const u8, bundle_id_len: usize, icon_path: [*]const u8, icon_path_len: usize, window_label: [*]const u8, window_label_len: usize, x: f64, y: f64, width: f64, height: f64, restore_frame: c_int, resizable: c_int, titlebar_style: c_int, show_policy: c_int) ?*AppKitHost;
+extern fn native_sdk_appkit_create(app_name: [*]const u8, app_name_len: usize, display_name: [*]const u8, display_name_len: usize, version: [*]const u8, version_len: usize, about_description: [*]const u8, about_description_len: usize, has_web_content: c_int, window_title: [*]const u8, window_title_len: usize, bundle_id: [*]const u8, bundle_id_len: usize, icon_path: [*]const u8, icon_path_len: usize, window_label: [*]const u8, window_label_len: usize, x: f64, y: f64, width: f64, height: f64, restore_frame: c_int, resizable: c_int, titlebar_style: c_int, show_policy: c_int, window_flags: u32) ?*AppKitHost;
 extern fn native_sdk_appkit_destroy(host: *AppKitHost) void;
 extern fn native_sdk_appkit_set_dock_icon_rgba(host: *AppKitHost, pixels: [*]const u8, width: usize, height: usize) void;
 extern fn native_sdk_appkit_set_dock_icon_file(host: *AppKitHost, path: [*]const u8, path_len: usize) void;
@@ -173,7 +174,7 @@ extern fn native_sdk_appkit_set_security_policy(host: *AppKitHost, allowed_origi
 extern fn native_sdk_appkit_set_menus(host: *AppKitHost, menu_titles: [*]const [*]const u8, menu_title_lens: [*]const usize, menu_count: usize, item_menu_indices: [*]const u32, item_labels: [*]const [*]const u8, item_label_lens: [*]const usize, item_commands: [*]const [*]const u8, item_command_lens: [*]const usize, item_keys: [*]const [*]const u8, item_key_lens: [*]const usize, item_modifiers: [*]const u32, item_separators: [*]const c_int, item_enabled: [*]const c_int, item_checked: [*]const c_int, item_count: usize) void;
 extern fn native_sdk_appkit_set_shortcuts(host: *AppKitHost, ids: [*]const [*]const u8, id_lens: [*]const usize, keys: [*]const [*]const u8, key_lens: [*]const usize, modifiers: [*]const u32, count: usize) void;
 extern fn native_sdk_appkit_request_frame(host: *AppKitHost) void;
-extern fn native_sdk_appkit_create_window(host: *AppKitHost, window_id: u64, window_title: [*]const u8, window_title_len: usize, window_label: [*]const u8, window_label_len: usize, x: f64, y: f64, width: f64, height: f64, restore_frame: c_int, resizable: c_int, titlebar_style: c_int, show_policy: c_int) c_int;
+extern fn native_sdk_appkit_create_window(host: *AppKitHost, window_id: u64, window_title: [*]const u8, window_title_len: usize, window_label: [*]const u8, window_label_len: usize, x: f64, y: f64, width: f64, height: f64, restore_frame: c_int, resizable: c_int, titlebar_style: c_int, show_policy: c_int, window_flags: u32) c_int;
 extern fn native_sdk_appkit_set_window_content_min_size(host: *AppKitHost, window_id: u64, min_width: f64, min_height: f64) c_int;
 extern fn native_sdk_appkit_focus_window(host: *AppKitHost, window_id: u64) c_int;
 extern fn native_sdk_appkit_close_window(host: *AppKitHost, window_id: u64) c_int;
@@ -595,6 +596,7 @@ pub const MacPlatform = struct {
 
     pub fn initWithOptions(size: geometry.SizeF, web_engine: platform_mod.WebEngine, app_info: platform_mod.AppInfo) Error!MacPlatform {
         const window_options = app_info.resolvedMainWindow();
+        try refuseUnsupportedTransparentWindow(web_engine, window_options);
         const window_title = window_options.resolvedTitle(app_info.app_name);
         const frame = window_options.default_frame;
         const display_name = app_info.resolvedDisplayName();
@@ -610,7 +612,7 @@ pub const MacPlatform = struct {
         // the classic load byte-for-byte.
         const dock_icon = planDockIcon(app_info.icon_path);
         const icon_path = if (dock_icon == .host_file) app_info.icon_path else "";
-        const host = native_sdk_appkit_create(app_info.app_name.ptr, app_info.app_name.len, display_name.ptr, display_name.len, app_info.version.ptr, app_info.version.len, app_info.description.ptr, app_info.description.len, if (app_info.has_web_content) 1 else 0, window_title.ptr, window_title.len, app_info.bundle_id.ptr, app_info.bundle_id.len, icon_path.ptr, icon_path.len, window_options.label.ptr, window_options.label.len, frame.x, frame.y, frame.width, frame.height, if (window_options.restore_state) 1 else 0, if (window_options.resizable) 1 else 0, titlebarStyleInt(window_options.titlebar), showModeInt(window_options.show)) orelse return error.CreateFailed;
+        const host = native_sdk_appkit_create(app_info.app_name.ptr, app_info.app_name.len, display_name.ptr, display_name.len, app_info.version.ptr, app_info.version.len, app_info.description.ptr, app_info.description.len, if (app_info.has_web_content) 1 else 0, window_title.ptr, window_title.len, app_info.bundle_id.ptr, app_info.bundle_id.len, icon_path.ptr, icon_path.len, window_options.label.ptr, window_options.label.len, frame.x, frame.y, frame.width, frame.height, if (window_options.restore_state) 1 else 0, if (window_options.resizable) 1 else 0, titlebarStyleInt(window_options.titlebar), showModeInt(window_options.show), windowFlags(window_options)) orelse return error.CreateFailed;
         switch (dock_icon) {
             .host_file => {},
             .masked_render => spawnDevDockIconRender(host, app_info.icon_path),
@@ -1220,6 +1222,19 @@ fn showModeInt(mode: platform_mod.WindowShowMode) c_int {
     };
 }
 
+fn windowFlags(options: platform_mod.WindowOptions) u32 {
+    var flags: u32 = 0;
+    if (options.transparent) flags |= 1 << 0;
+    if (options.always_on_top) flags |= 1 << 1;
+    if (options.click_through) flags |= 1 << 2;
+    if (!options.activate_on_show) flags |= 1 << 3;
+    return flags;
+}
+
+fn refuseUnsupportedTransparentWindow(web_engine: platform_mod.WebEngine, options: platform_mod.WindowOptions) Error!void {
+    if (web_engine == .chromium and options.transparent) return error.UnsupportedWindowTransparency;
+}
+
 fn closePolicyInt(policy: platform_mod.WindowClosePolicy) c_int {
     return switch (policy) {
         .quit => 0,
@@ -1249,9 +1264,10 @@ fn applyWindowContentMinSize(host: *AppKitHost, window_id: u64, min_width: f32, 
 
 fn createWindow(context: ?*anyopaque, options: platform_mod.WindowOptions) anyerror!platform_mod.WindowInfo {
     const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+    try refuseUnsupportedTransparentWindow(self.web_engine, options);
     const title = options.resolvedTitle(self.app_info.app_name);
     const frame = options.default_frame;
-    if (native_sdk_appkit_create_window(self.host, options.id, title.ptr, title.len, options.label.ptr, options.label.len, frame.x, frame.y, frame.width, frame.height, if (options.restore_state) 1 else 0, if (options.resizable) 1 else 0, titlebarStyleInt(options.titlebar), showModeInt(options.show)) == 0) return error.CreateFailed;
+    if (native_sdk_appkit_create_window(self.host, options.id, title.ptr, title.len, options.label.ptr, options.label.len, frame.x, frame.y, frame.width, frame.height, if (options.restore_state) 1 else 0, if (options.resizable) 1 else 0, titlebarStyleInt(options.titlebar), showModeInt(options.show), windowFlags(options)) == 0) return error.CreateFailed;
     applyWindowContentMinSize(self.host, options.id, options.min_width, options.min_height);
     applyWindowClosePolicy(self.host, options.id, options.close_policy);
     return .{
@@ -1261,7 +1277,7 @@ fn createWindow(context: ?*anyopaque, options: platform_mod.WindowOptions) anyer
         .frame = frame,
         .scale_factor = 1,
         .open = true,
-        .focused = false,
+        .focused = options.activate_on_show and options.show == .immediate,
     };
 }
 
@@ -2252,6 +2268,22 @@ test "macos chromium reports unsupported native surfaces" {
     try std.testing.expect(!MacPlatform.supportsFeature(&chromium, .view_surface_adoption));
 }
 
+test "macos chromium refuses transparent windows" {
+    try refuseUnsupportedTransparentWindow(.system, .{ .transparent = true });
+    try refuseUnsupportedTransparentWindow(.chromium, .{});
+    try std.testing.expectError(
+        error.UnsupportedWindowTransparency,
+        refuseUnsupportedTransparentWindow(.chromium, .{ .transparent = true }),
+    );
+
+    const host_source = @embedFile("cef_host.mm");
+    try std.testing.expect(std.mem.count(
+        u8,
+        host_source,
+        "if ((window_flags & (1u << 0)) != 0) return",
+    ) >= 2);
+}
+
 fn testPlatformWithEngine(web_engine: platform_mod.WebEngine) MacPlatform {
     return .{
         .host = undefined,
@@ -2421,6 +2453,112 @@ test "mac webview presses report the focused child label" {
     try std.testing.expect(std.mem.indexOf(u8, host_source, "NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown | NSEventMaskOtherMouseDown") != null);
     try std.testing.expect(std.mem.indexOf(u8, host_source, ".kind = NATIVE_SDK_APPKIT_EVENT_VIEW_FOCUSED") != null);
     try std.testing.expect(std.mem.indexOf(u8, host_source, ".view_label = label") != null);
+}
+
+test "mac active implicit show activates before making the window key" {
+    const host_source = @embedFile("appkit_host.m");
+    try std.testing.expect(std.mem.indexOf(u8, host_source,
+        \\    if ([self.passiveShowWindows containsObject:@(windowId)]) {
+        \\        [window orderFront:nil];
+        \\    } else {
+        \\        [NSApp activate];
+        \\        [window makeKeyAndOrderFront:nil];
+        \\    }
+    ) != null);
+}
+
+test "mac explicit focus activates before making the window key" {
+    const host_source = @embedFile("appkit_host.m");
+    try std.testing.expect(std.mem.indexOf(u8, host_source,
+        \\- (void)focusWindowWithId:(uint64_t)windowId {
+        \\    NSWindow *window = self.windows[@(windowId)];
+        \\    if (!window) return;
+        \\    // An explicit focus overrides a pending present-before-show defer:
+        \\    // the runtime asked for the window NOW.
+        \\    [self.deferredShowWindows removeObjectForKey:@(windowId)];
+        \\    [NSApp activate];
+        \\    [window makeKeyAndOrderFront:nil];
+    ) != null);
+}
+
+test "mac transparent raw frames are premultiplied exactly once before Metal upload" {
+    const host_source = @embedFile("appkit_host.m");
+    const helper_at = std.mem.indexOf(
+        u8,
+        host_source,
+        "static void NativeSdkPremultiplyStraightRgba8",
+    ) orelse return error.TestExpectedEqual;
+    const present_at = std.mem.indexOfPos(
+        u8,
+        host_source,
+        helper_at,
+        "- (BOOL)presentPixelsWithWidth:",
+    ) orelse return error.TestExpectedEqual;
+    const present_tail = host_source[present_at..];
+
+    try std.testing.expect(helper_at < present_at);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        present_tail,
+        "if (self.window && !self.window.opaque && !sourceIsPremultiplied)",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        present_tail,
+        "NativeSdkPremultiplyStraightRgba8(",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        present_tail,
+        "sourceIsPremultiplied:YES rgba8:(const uint8_t *)pixels.bytes",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        present_tail,
+        "sourceIsPremultiplied:NO rgba8:rgba8",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        present_tail,
+        "const uint8_t *uploadBytes = presentBytes +",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        present_tail,
+        "memcpy(backingBytes, presentBytes, byteLength);",
+    ) != null);
+}
+
+test "mac transparent gpu surfaces clear missing canvas content to transparent" {
+    const host_source = @embedFile("appkit_host.m");
+    const render_at = std.mem.indexOf(
+        u8,
+        host_source,
+        "- (void)renderFrame {",
+    ) orelse return error.TestExpectedEqual;
+    const render_end = std.mem.indexOfPos(
+        u8,
+        host_source,
+        render_at,
+        "- (BOOL)acceptsFirstResponder",
+    ) orelse return error.TestExpectedEqual;
+    const render_source = host_source[render_at..render_end];
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        render_source,
+        "const BOOL transparentWindow = window != nil && !window.opaque;",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, render_source,
+        \\descriptor.colorAttachments[0].clearColor = transparentWindow
+        \\        ? MTLClearColorMake(0.0, 0.0, 0.0, 0.0)
+        \\        : MTLClearColorMake(red, green, blue, 1.0);
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        render_source,
+        "if (self.hasCanvasTexture && canvasTextureMatchesDrawable",
+    ) != null);
 }
 
 test "mac Chromium webview focus reports the focused child label" {

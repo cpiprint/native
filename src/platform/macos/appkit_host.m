@@ -415,6 +415,12 @@ static NSMutableDictionary *NativeSdkCredentialQuery(NSString *service, NSString
 @property(nonatomic, strong) CAMetalLayer *metalLayer;
 @property(nonatomic, strong) id<MTLBuffer> sampleBuffer;
 @property(nonatomic, strong) id<MTLTexture> canvasTexture;
+/* Reused conversion storage for the CPU reference renderer's
+ * straight-alpha RGBA8 frames. A nonopaque CAMetalLayer participates in
+ * Core Animation's premultiplied-alpha compositing, so software
+ * fallbacks must enter the shared canvas texture in the same encoding
+ * as packet-rendered frames. */
+@property(nonatomic, strong) NSMutableData *canvasPixelUploadScratch;
 @property(nonatomic, strong) id<MTLRenderPipelineState> canvasRenderPipeline;
 @property(nonatomic, strong) id<MTLSamplerState> canvasSampler;
 @property(nonatomic, assign) CGColorSpaceRef canvasColorSpace;
@@ -624,7 +630,7 @@ static NSMutableDictionary *NativeSdkCredentialQuery(NSString *service, NSString
 - (void)configureWithHost:(NativeSdkAppKitHost *)host windowId:(uint64_t)windowId label:(NSString *)label;
 - (BOOL)isAvailable;
 - (void)updateDrawableSize;
-- (BOOL)presentPixelsWithWidth:(NSUInteger)width height:(NSUInteger)height scale:(CGFloat)scale hasDirtyRect:(BOOL)hasDirtyRect dirtyX:(CGFloat)dirtyX dirtyY:(CGFloat)dirtyY dirtyWidth:(CGFloat)dirtyWidth dirtyHeight:(CGFloat)dirtyHeight dirtyRects:(NSArray<NSValue *> *)dirtyRects rgba8:(const uint8_t *)rgba8 byteLength:(NSUInteger)byteLength;
+- (BOOL)presentPixelsWithWidth:(NSUInteger)width height:(NSUInteger)height scale:(CGFloat)scale hasDirtyRect:(BOOL)hasDirtyRect dirtyX:(CGFloat)dirtyX dirtyY:(CGFloat)dirtyY dirtyWidth:(CGFloat)dirtyWidth dirtyHeight:(CGFloat)dirtyHeight dirtyRects:(NSArray<NSValue *> *)dirtyRects sourceIsPremultiplied:(BOOL)sourceIsPremultiplied rgba8:(const uint8_t *)rgba8 byteLength:(NSUInteger)byteLength;
 - (NSInteger)presentGpuPacketWithSurfaceWidth:(CGFloat)surfaceWidth height:(CGFloat)surfaceHeight scale:(CGFloat)scale clearR:(uint8_t)clearR clearG:(uint8_t)clearG clearB:(uint8_t)clearB clearA:(uint8_t)clearA requiresRender:(BOOL)requiresRender commandCount:(NSUInteger)commandCount unsupportedCommandCount:(NSUInteger)unsupportedCommandCount representable:(BOOL)representable json:(const uint8_t *)json byteLength:(NSUInteger)byteLength;
 - (NSInteger)presentGpuPacketBinaryWithSurfaceWidth:(CGFloat)surfaceWidth height:(CGFloat)surfaceHeight scale:(CGFloat)scale clearR:(uint8_t)clearR clearG:(uint8_t)clearG clearB:(uint8_t)clearB clearA:(uint8_t)clearA requiresRender:(BOOL)requiresRender commandCount:(NSUInteger)commandCount unsupportedCommandCount:(NSUInteger)unsupportedCommandCount representable:(BOOL)representable packet:(const uint8_t *)packet byteLength:(NSUInteger)byteLength;
 - (NSInteger)presentGpuPacketObject:(NSDictionary *)packet surfaceWidth:(CGFloat)surfaceWidth height:(CGFloat)surfaceHeight scale:(CGFloat)scale clearR:(uint8_t)clearR clearG:(uint8_t)clearG clearB:(uint8_t)clearB clearA:(uint8_t)clearA commandCount:(NSUInteger)commandCount;
@@ -718,6 +724,9 @@ static NSMutableDictionary *NativeSdkCredentialQuery(NSString *service, NSString
 /// the delegate's windowShouldClose: consults it, so the user's close
 /// affordance hides a .hide window instead of closing it.
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *windowClosePolicies;
+/// Windows whose implicit reveal is passive (`activate_on_show=false`).
+/// Explicit focusWindow bypasses this set and activates deliberately.
+@property(nonatomic, strong) NSMutableSet<NSNumber *> *passiveShowWindows;
 /// Windows currently hidden BY their .hide close policy — the set the
 /// Dock reopen re-shows, and the truth emitWindowFrameForWindowId's
 /// hidden flag reports. Ordinary orderOut/minimize states never enter
@@ -911,8 +920,9 @@ static NSMutableDictionary *NativeSdkCredentialQuery(NSString *service, NSString
 @property(nonatomic, strong) NSArray<NSString *> *allowedNavigationOrigins;
 @property(nonatomic, strong) NSArray<NSString *> *allowedExternalURLs;
 @property(nonatomic, assign) NSInteger externalLinkAction;
-- (instancetype)initWithAppName:(NSString *)appName displayName:(NSString *)displayName version:(NSString *)version aboutDescription:(NSString *)aboutDescription hasWebContent:(BOOL)hasWebContent windowTitle:(NSString *)windowTitle bundleIdentifier:(NSString *)bundleIdentifier iconPath:(NSString *)iconPath windowLabel:(NSString *)windowLabel x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame resizable:(BOOL)resizable titlebarStyle:(int)titlebarStyle showPolicy:(int)showPolicy;
-- (BOOL)createWindowWithId:(uint64_t)windowId title:(NSString *)title label:(NSString *)label x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame resizable:(BOOL)resizable titlebarStyle:(int)titlebarStyle showPolicy:(int)showPolicy makeMain:(BOOL)makeMain;
+- (instancetype)initWithAppName:(NSString *)appName displayName:(NSString *)displayName version:(NSString *)version aboutDescription:(NSString *)aboutDescription hasWebContent:(BOOL)hasWebContent windowTitle:(NSString *)windowTitle bundleIdentifier:(NSString *)bundleIdentifier iconPath:(NSString *)iconPath windowLabel:(NSString *)windowLabel x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame resizable:(BOOL)resizable titlebarStyle:(int)titlebarStyle showPolicy:(int)showPolicy windowFlags:(uint32_t)windowFlags;
+- (BOOL)createWindowWithId:(uint64_t)windowId title:(NSString *)title label:(NSString *)label x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame resizable:(BOOL)resizable titlebarStyle:(int)titlebarStyle showPolicy:(int)showPolicy windowFlags:(uint32_t)windowFlags makeMain:(BOOL)makeMain;
+- (void)orderWindowForImplicitShow:(uint64_t)windowId;
 - (void)showDeferredWindowIfPending:(uint64_t)windowId reason:(const char *)reason;
 - (void)applyWindowClearColor:(uint64_t)windowId red:(uint8_t)red green:(uint8_t)green blue:(uint8_t)blue alpha:(uint8_t)alpha;
 - (void)focusWindowWithId:(uint64_t)windowId;
@@ -1223,6 +1233,7 @@ static void NativeSdkEmitGpuSurfaceResizes(NSView *view) {
     [self.host.deferredShowWindows removeObjectForKey:key];
     [self.host.windowClearColors removeObjectForKey:key];
     [self.host.windowClosePolicies removeObjectForKey:key];
+    [self.host.passiveShowWindows removeObject:key];
     if (self.host.windows.count == 0) {
         [self.host emitShutdown];
         [self.host stop];
@@ -3513,6 +3524,18 @@ static NSDictionary *NativeSdkPacketDictionaryFromBinary(const uint8_t *bytes, N
 
 @end
 
+static void NativeSdkPremultiplyStraightRgba8(const uint8_t *source, uint8_t *destination, NSUInteger pixelCount) {
+    if (!source || !destination) return;
+    for (NSUInteger index = 0; index < pixelCount; index += 1) {
+        const NSUInteger offset = index * 4;
+        const uint32_t alpha = source[offset + 3];
+        destination[offset + 0] = (uint8_t)((source[offset + 0] * alpha + 127) / 255);
+        destination[offset + 1] = (uint8_t)((source[offset + 1] * alpha + 127) / 255);
+        destination[offset + 2] = (uint8_t)((source[offset + 2] * alpha + 127) / 255);
+        destination[offset + 3] = (uint8_t)alpha;
+    }
+}
+
 @implementation NativeSdkMetalSurfaceView
 
 - (instancetype)initWithFrame:(NSRect)frameRect {
@@ -3592,11 +3615,12 @@ static NSDictionary *NativeSdkPacketDictionaryFromBinary(const uint8_t *bytes, N
 }
 
 - (BOOL)isOpaque {
-    return YES;
+    return self.window ? self.window.opaque : YES;
 }
 
 - (void)viewDidMoveToWindow {
     [super viewDidMoveToWindow];
+    self.metalLayer.opaque = self.window ? self.window.opaque : YES;
     self.window.acceptsMouseMovedEvents = YES;
     [self updateDrawableSize];
     [self updateSurfaceTrackingArea];
@@ -3686,10 +3710,26 @@ static NSDictionary *NativeSdkPacketDictionaryFromBinary(const uint8_t *bytes, N
     }
 }
 
-- (BOOL)presentPixelsWithWidth:(NSUInteger)width height:(NSUInteger)height scale:(CGFloat)scale hasDirtyRect:(BOOL)hasDirtyRect dirtyX:(CGFloat)dirtyX dirtyY:(CGFloat)dirtyY dirtyWidth:(CGFloat)dirtyWidth dirtyHeight:(CGFloat)dirtyHeight dirtyRects:(NSArray<NSValue *> *)dirtyRects rgba8:(const uint8_t *)rgba8 byteLength:(NSUInteger)byteLength {
+- (BOOL)presentPixelsWithWidth:(NSUInteger)width height:(NSUInteger)height scale:(CGFloat)scale hasDirtyRect:(BOOL)hasDirtyRect dirtyX:(CGFloat)dirtyX dirtyY:(CGFloat)dirtyY dirtyWidth:(CGFloat)dirtyWidth dirtyHeight:(CGFloat)dirtyHeight dirtyRects:(NSArray<NSValue *> *)dirtyRects sourceIsPremultiplied:(BOOL)sourceIsPremultiplied rgba8:(const uint8_t *)rgba8 byteLength:(NSUInteger)byteLength {
     if (![self isAvailable] || !rgba8 || width == 0 || height == 0) return NO;
     if (byteLength != width * height * 4) return NO;
     if (![self ensureCanvasPresenter]) return NO;
+
+    const uint8_t *presentBytes = rgba8;
+    /* Raw runtime presents carry straight RGBA, while the packet renderer's
+     * Core Graphics context already writes premultiplied RGBA. Metal blends
+     * both through the same premultiplied-alpha texture contract. */
+    if (self.window && !self.window.opaque && !sourceIsPremultiplied) {
+        if (!self.canvasPixelUploadScratch || self.canvasPixelUploadScratch.length != byteLength) {
+            self.canvasPixelUploadScratch = [NSMutableData dataWithLength:byteLength];
+        }
+        if (!self.canvasPixelUploadScratch || self.canvasPixelUploadScratch.length != byteLength) return NO;
+        NativeSdkPremultiplyStraightRgba8(
+            rgba8,
+            self.canvasPixelUploadScratch.mutableBytes,
+            byteLength / 4);
+        presentBytes = self.canvasPixelUploadScratch.bytes;
+    }
 
     BOOL textureChanged = NO;
     if (!self.canvasTexture || self.canvasTextureWidth != width || self.canvasTextureHeight != height) {
@@ -3764,21 +3804,21 @@ static NSDictionary *NativeSdkPacketDictionaryFromBinary(const uint8_t *bytes, N
                 return YES;
             }
         }
-        const uint8_t *uploadBytes = rgba8 + ((uploadY * width + uploadX) * 4);
+        const uint8_t *uploadBytes = presentBytes + ((uploadY * width + uploadX) * 4);
         [self.canvasTexture replaceRegion:MTLRegionMake2D(uploadX, uploadY, uploadWidth, uploadHeight)
                               mipmapLevel:0
                                 withBytes:uploadBytes
                               bytesPerRow:width * 4];
         if (backingBytes) {
             if (uploadFullTexture) {
-                memcpy(backingBytes, rgba8, byteLength);
+                memcpy(backingBytes, presentBytes, byteLength);
                 /* A full foreign upload (raw-pixels present) makes the
                  * backing match the glass byte-for-byte again. */
                 self.canvasPacketPixelsValid = YES;
             } else {
                 for (NSUInteger row = 0; row < uploadHeight; row++) {
                     const NSUInteger rowOffset = ((uploadY + row) * width + uploadX) * 4;
-                    memcpy((uint8_t *)backingBytes + rowOffset, rgba8 + rowOffset, uploadWidth * 4);
+                    memcpy((uint8_t *)backingBytes + rowOffset, presentBytes + rowOffset, uploadWidth * 4);
                 }
             }
         }
@@ -5302,7 +5342,7 @@ static BOOL NativeSdkCompositeBlurWriteRegion(NSDictionary *command, CGFloat sca
     }
 
     BOOL uploadDirtyRect = directRetainedDirtyUpdate;
-    BOOL presented = [self presentPixelsWithWidth:pixelWidth height:pixelHeight scale:normalizedScale hasDirtyRect:uploadDirtyRect dirtyX:scissorRect.origin.x dirtyY:scissorRect.origin.y dirtyWidth:scissorRect.size.width dirtyHeight:scissorRect.size.height dirtyRects:(uploadDirtyRect ? dirtyRects : nil) rgba8:(const uint8_t *)pixels.bytes byteLength:pixels.length];
+    BOOL presented = [self presentPixelsWithWidth:pixelWidth height:pixelHeight scale:normalizedScale hasDirtyRect:uploadDirtyRect dirtyX:scissorRect.origin.x dirtyY:scissorRect.origin.y dirtyWidth:scissorRect.size.width dirtyHeight:scissorRect.size.height dirtyRects:(uploadDirtyRect ? dirtyRects : nil) sourceIsPremultiplied:YES rgba8:(const uint8_t *)pixels.bytes byteLength:pixels.length];
     if (getenv("NATIVE_SDK_GPU_DRAW_TRACE")) {
         /* Per-present phase split (draw vs texture upload + Metal present),
          * NATIVE_SDK_WINDOW_TIMING-style stderr diagnostics. */
@@ -5823,12 +5863,22 @@ static BOOL NativeSdkCompositeBlurWriteRegion(NSDictionary *command, CGFloat sca
     const double red = self.hasCanvasTexture ? 0.965 : 0.10 + 0.08 * sin(phase * 6.283185307179586);
     const double green = self.hasCanvasTexture ? 0.973 : 0.18 + 0.10 * sin((phase + 0.33) * 6.283185307179586);
     const double blue = self.hasCanvasTexture ? 0.988 : 0.34 + 0.16 * sin((phase + 0.66) * 6.283185307179586);
+    const BOOL transparentWindow = window != nil && !window.opaque;
 
     MTLRenderPassDescriptor *descriptor = [MTLRenderPassDescriptor renderPassDescriptor];
     descriptor.colorAttachments[0].texture = drawable.texture;
     descriptor.colorAttachments[0].loadAction = MTLLoadActionClear;
     descriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
-    descriptor.colorAttachments[0].clearColor = MTLClearColorMake(red, green, blue, 1.0);
+    // The clear remains visible when the renderer has not supplied a
+    // canvas texture yet, and briefly while a resize's retained texture
+    // does not match the new drawable. An opaque placeholder is useful
+    // for an ordinary window, but it defeats a transparent overlay's
+    // contract exactly when the late-reveal fallback exposes that state.
+    // Clear transparent glass to transparent black (valid premultiplied
+    // alpha); a matching canvas texture still draws over the whole pass.
+    descriptor.colorAttachments[0].clearColor = transparentWindow
+        ? MTLClearColorMake(0.0, 0.0, 0.0, 0.0)
+        : MTLClearColorMake(red, green, blue, 1.0);
 
     id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
     if (!commandBuffer) return;
@@ -7133,7 +7183,7 @@ static BOOL NativeSdkScrollDriverCanConsumeHorizontally(NativeSdkScrollDriverVie
 
 @implementation NativeSdkAppKitHost
 
-- (instancetype)initWithAppName:(NSString *)appName displayName:(NSString *)displayName version:(NSString *)version aboutDescription:(NSString *)aboutDescription hasWebContent:(BOOL)hasWebContent windowTitle:(NSString *)windowTitle bundleIdentifier:(NSString *)bundleIdentifier iconPath:(NSString *)iconPath windowLabel:(NSString *)windowLabel x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame resizable:(BOOL)resizable titlebarStyle:(int)titlebarStyle showPolicy:(int)showPolicy {
+- (instancetype)initWithAppName:(NSString *)appName displayName:(NSString *)displayName version:(NSString *)version aboutDescription:(NSString *)aboutDescription hasWebContent:(BOOL)hasWebContent windowTitle:(NSString *)windowTitle bundleIdentifier:(NSString *)bundleIdentifier iconPath:(NSString *)iconPath windowLabel:(NSString *)windowLabel x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame resizable:(BOOL)resizable titlebarStyle:(int)titlebarStyle showPolicy:(int)showPolicy windowFlags:(uint32_t)windowFlags {
     self = [super init];
     if (!self) {
         return nil;
@@ -7162,6 +7212,7 @@ static BOOL NativeSdkScrollDriverCanConsumeHorizontally(NativeSdkScrollDriverVie
     self.deferredShowWindows = [[NSMutableDictionary alloc] init];
     self.windowClearColors = [[NSMutableDictionary alloc] init];
     self.windowClosePolicies = [[NSMutableDictionary alloc] init];
+    self.passiveShowWindows = [[NSMutableSet alloc] init];
     self.policyHiddenWindows = [[NSMutableSet alloc] init];
     self.childWebViews = [[NSMutableDictionary alloc] init];
     self.nativeViews = [[NSMutableDictionary alloc] init];
@@ -7178,7 +7229,7 @@ static BOOL NativeSdkScrollDriverCanConsumeHorizontally(NativeSdkScrollDriverVie
     [self configureApplication];
     NativeSdkLaunchLap("app_configured");
 
-    [self createWindowWithId:1 title:(windowTitle.length > 0 ? windowTitle : self.appName) label:self.windowLabel x:x y:y width:width height:height restoreFrame:restoreFrame resizable:resizable titlebarStyle:titlebarStyle showPolicy:showPolicy makeMain:YES];
+    [self createWindowWithId:1 title:(windowTitle.length > 0 ? windowTitle : self.appName) label:self.windowLabel x:x y:y width:width height:height restoreFrame:restoreFrame resizable:resizable titlebarStyle:titlebarStyle showPolicy:showPolicy windowFlags:windowFlags makeMain:YES];
     self.didShutdown = NO;
     self.pendingPreRunStop = NO;
     self.observesApplicationActivation = NO;
@@ -7186,7 +7237,7 @@ static BOOL NativeSdkScrollDriverCanConsumeHorizontally(NativeSdkScrollDriverVie
     return self;
 }
 
-- (BOOL)createWindowWithId:(uint64_t)windowId title:(NSString *)title label:(NSString *)label x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame resizable:(BOOL)resizable titlebarStyle:(int)titlebarStyle showPolicy:(int)showPolicy makeMain:(BOOL)makeMain {
+- (BOOL)createWindowWithId:(uint64_t)windowId title:(NSString *)title label:(NSString *)label x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame resizable:(BOOL)resizable titlebarStyle:(int)titlebarStyle showPolicy:(int)showPolicy windowFlags:(uint32_t)windowFlags makeMain:(BOOL)makeMain {
     NSNumber *key = @(windowId);
     if (self.windows[key]) {
         return NO;
@@ -7243,6 +7294,15 @@ static BOOL NativeSdkScrollDriverCanConsumeHorizontally(NativeSdkScrollDriverVie
     // next autorelease-pool drain; the main window only ever closes at
     // shutdown, which is why this stayed hidden until windows_fn).
     window.releasedWhenClosed = NO;
+    // Overlay behavior is installed before the first order-front so no
+    // opaque, focus-taking, or interactive intermediate window can flash.
+    if ((windowFlags & (1u << 0)) != 0) {
+        window.opaque = NO;
+        window.backgroundColor = NSColor.clearColor;
+    }
+    if ((windowFlags & (1u << 1)) != 0) window.level = NSFloatingWindowLevel;
+    if ((windowFlags & (1u << 2)) != 0) window.ignoresMouseEvents = YES;
+    if ((windowFlags & (1u << 3)) != 0) [self.passiveShowWindows addObject:key];
     [window setTitle:(title.length > 0 ? title : self.appName)];
     if (titlebarStyle == 1 || titlebarStyle == 2) {
         window.titlebarAppearsTransparent = YES;
@@ -7314,10 +7374,25 @@ static BOOL NativeSdkScrollDriverCanConsumeHorizontally(NativeSdkScrollDriverVie
         self.delegate = delegate;
         self.windowLabel = label.length > 0 ? label : @"main";
     } else if (showPolicy != 1) {
-        [window makeKeyAndOrderFront:nil];
-        [NSApp activate];
+        [self orderWindowForImplicitShow:windowId];
     }
     return YES;
+}
+
+// Implicit shows honor `activate_on_show`: passive overlays are ordered
+// front without changing the active app or key window. Explicit focus
+// continues to activate and makeKeyAndOrderFront. Activation comes
+// first: a first-present window can reveal while the app is inactive,
+// and asking that inactive app to make a window key is only best effort.
+- (void)orderWindowForImplicitShow:(uint64_t)windowId {
+    NSWindow *window = self.windows[@(windowId)];
+    if (!window) return;
+    if ([self.passiveShowWindows containsObject:@(windowId)]) {
+        [window orderFront:nil];
+    } else {
+        [NSApp activate];
+        [window makeKeyAndOrderFront:nil];
+    }
 }
 
 // Order a deferred-show window front exactly once — from the first
@@ -7334,8 +7409,7 @@ static BOOL NativeSdkScrollDriverCanConsumeHorizontally(NativeSdkScrollDriverVie
         const double elapsedMs = (double)(NativeSdkTimestampNanoseconds() - createdNs.unsignedLongLongValue) / 1e6;
         fprintf(stderr, "native-sdk: window %llu shown (%s) %.1f ms after create wall_ns=%llu\n", (unsigned long long)windowId, reason, elapsedMs, (unsigned long long)clock_gettime_nsec_np(CLOCK_REALTIME));
     }
-    [window makeKeyAndOrderFront:nil];
-    [NSApp activate];
+    [self orderWindowForImplicitShow:windowId];
     [self emitWindowFrameForWindowId:windowId open:YES];
     [self scheduleFrame];
 }
@@ -7386,8 +7460,8 @@ static BOOL NativeSdkScrollDriverCanConsumeHorizontally(NativeSdkScrollDriverVie
     // An explicit focus overrides a pending present-before-show defer:
     // the runtime asked for the window NOW.
     [self.deferredShowWindows removeObjectForKey:@(windowId)];
-    [window makeKeyAndOrderFront:nil];
     [NSApp activate];
+    [window makeKeyAndOrderFront:nil];
     [self emitWindowFrameForWindowId:windowId open:YES];
     [self scheduleFrame];
 }
@@ -7430,7 +7504,8 @@ static BOOL NativeSdkScrollDriverCanConsumeHorizontally(NativeSdkScrollDriverVie
 }
 
 // The counterpart show verb: bring a hidden (or merely unfocused)
-// window back to the glass and activate the app — the tray-menu
+// window back to the glass, activating unless its creation-time
+// presentation policy is passive — the tray-menu
 // "Open" consequence and the Dock reopen both land here. Also clears a
 // pending present-before-show defer and a minimize, for the same
 // reason focusWindowWithId: does: the runtime asked for the window NOW.
@@ -7440,8 +7515,7 @@ static BOOL NativeSdkScrollDriverCanConsumeHorizontally(NativeSdkScrollDriverVie
     [self.policyHiddenWindows removeObject:@(windowId)];
     [self.deferredShowWindows removeObjectForKey:@(windowId)];
     if (window.miniaturized) [window deminiaturize:nil];
-    [window makeKeyAndOrderFront:nil];
-    [NSApp activate];
+    [self orderWindowForImplicitShow:windowId];
     [self emitWindowFrameForWindowId:windowId open:YES];
     [self scheduleFrame];
 }
@@ -7975,7 +8049,7 @@ static BOOL NativeSdkScrollDriverCanConsumeHorizontally(NativeSdkScrollDriverVie
      * resync. (The packet path calls presentPixelsWithWidth internally,
      * so the invalidation lives here at the raw entry, not inside it.) */
     surface.hasCanvasRetainedState = NO;
-    const BOOL presented = [surface presentPixelsWithWidth:width height:height scale:scale hasDirtyRect:hasDirtyRect dirtyX:dirtyX dirtyY:dirtyY dirtyWidth:dirtyWidth dirtyHeight:dirtyHeight dirtyRects:nil rgba8:rgba8 byteLength:byteLength];
+    const BOOL presented = [surface presentPixelsWithWidth:width height:height scale:scale hasDirtyRect:hasDirtyRect dirtyX:dirtyX dirtyY:dirtyY dirtyWidth:dirtyWidth dirtyHeight:dirtyHeight dirtyRects:nil sourceIsPremultiplied:NO rgba8:rgba8 byteLength:byteLength];
     if (presented) [self showDeferredWindowIfPending:windowId reason:"first-present"];
     return presented;
 }
@@ -9064,9 +9138,8 @@ static void NativeSdkApplyProcessDisplayName(NSString *displayName) {
     // here and appears when its first canvas present lands (or the
     // create-time fallback deadline fires).
     if (!self.deferredShowWindows[@1]) {
-        [self.window makeKeyAndOrderFront:nil];
+        [self orderWindowForImplicitShow:1];
     }
-    [NSApp activate];
     if (!self.shortcutEventMonitor) {
         __weak NativeSdkAppKitHost *weakSelf = self;
         self.shortcutEventMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *event) {
@@ -11434,7 +11507,7 @@ static BOOL NativeSdkPolicyListMatches(NSArray<NSString *> *values, NSURL *url) 
     return NO;
 }
 
-native_sdk_appkit_host_t *native_sdk_appkit_create(const char *app_name, size_t app_name_len, const char *display_name, size_t display_name_len, const char *version, size_t version_len, const char *about_description, size_t about_description_len, int has_web_content, const char *window_title, size_t window_title_len, const char *bundle_id, size_t bundle_id_len, const char *icon_path, size_t icon_path_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, int show_policy) {
+native_sdk_appkit_host_t *native_sdk_appkit_create(const char *app_name, size_t app_name_len, const char *display_name, size_t display_name_len, const char *version, size_t version_len, const char *about_description, size_t about_description_len, int has_web_content, const char *window_title, size_t window_title_len, const char *bundle_id, size_t bundle_id_len, const char *icon_path, size_t icon_path_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, int show_policy, uint32_t window_flags) {
     @autoreleasepool {
         NSString *appNameString = [[NSString alloc] initWithBytes:app_name length:app_name_len encoding:NSUTF8StringEncoding] ?: @"native-sdk";
         NSString *displayNameString = [[NSString alloc] initWithBytes:display_name length:display_name_len encoding:NSUTF8StringEncoding] ?: @"";
@@ -11444,7 +11517,7 @@ native_sdk_appkit_host_t *native_sdk_appkit_create(const char *app_name, size_t 
         NSString *bundleIdString = [[NSString alloc] initWithBytes:bundle_id length:bundle_id_len encoding:NSUTF8StringEncoding] ?: @"dev.native_sdk.app";
         NSString *iconPathString = [[NSString alloc] initWithBytes:icon_path length:icon_path_len encoding:NSUTF8StringEncoding] ?: @"";
         NSString *windowLabelString = [[NSString alloc] initWithBytes:window_label length:window_label_len encoding:NSUTF8StringEncoding] ?: @"main";
-        NativeSdkAppKitHost *host = [[NativeSdkAppKitHost alloc] initWithAppName:appNameString displayName:displayNameString version:versionString aboutDescription:aboutDescriptionString hasWebContent:(has_web_content != 0) windowTitle:windowTitleString bundleIdentifier:bundleIdString iconPath:iconPathString windowLabel:windowLabelString x:x y:y width:width height:height restoreFrame:(restore_frame != 0) resizable:(resizable != 0) titlebarStyle:titlebar_style showPolicy:show_policy];
+        NativeSdkAppKitHost *host = [[NativeSdkAppKitHost alloc] initWithAppName:appNameString displayName:displayNameString version:versionString aboutDescription:aboutDescriptionString hasWebContent:(has_web_content != 0) windowTitle:windowTitleString bundleIdentifier:bundleIdString iconPath:iconPathString windowLabel:windowLabelString x:x y:y width:width height:height restoreFrame:(restore_frame != 0) resizable:(resizable != 0) titlebarStyle:titlebar_style showPolicy:show_policy windowFlags:window_flags];
         return (__bridge_retained native_sdk_appkit_host_t *)host;
     }
 }
@@ -11742,11 +11815,11 @@ void native_sdk_appkit_set_shortcuts(native_sdk_appkit_host_t *host, const char 
     [object setShortcutsWithIds:ids idLengths:id_lens keys:keys keyLengths:key_lens modifiers:modifiers count:count];
 }
 
-int native_sdk_appkit_create_window(native_sdk_appkit_host_t *host, uint64_t window_id, const char *window_title, size_t window_title_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, int show_policy) {
+int native_sdk_appkit_create_window(native_sdk_appkit_host_t *host, uint64_t window_id, const char *window_title, size_t window_title_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, int show_policy, uint32_t window_flags) {
     NativeSdkAppKitHost *object = (__bridge NativeSdkAppKitHost *)host;
     NSString *titleString = window_title ? [[NSString alloc] initWithBytes:window_title length:window_title_len encoding:NSUTF8StringEncoding] : @"";
     NSString *labelString = window_label ? [[NSString alloc] initWithBytes:window_label length:window_label_len encoding:NSUTF8StringEncoding] : @"";
-    return [object createWindowWithId:window_id title:titleString ?: @"" label:labelString ?: @"" x:x y:y width:width height:height restoreFrame:(restore_frame != 0) resizable:(resizable != 0) titlebarStyle:titlebar_style showPolicy:show_policy makeMain:NO] ? 1 : 0;
+    return [object createWindowWithId:window_id title:titleString ?: @"" label:labelString ?: @"" x:x y:y width:width height:height restoreFrame:(restore_frame != 0) resizable:(resizable != 0) titlebarStyle:titlebar_style showPolicy:show_policy windowFlags:window_flags makeMain:NO] ? 1 : 0;
 }
 
 int native_sdk_appkit_set_window_content_min_size(native_sdk_appkit_host_t *host, uint64_t window_id, double min_width, double min_height) {

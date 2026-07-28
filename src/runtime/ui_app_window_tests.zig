@@ -20,6 +20,7 @@ const settings_window_label = "settings";
 
 const PanelModel = struct {
     settings_open: bool = false,
+    transparent_settings: bool = false,
     bumps: u32 = 0,
     user_closes: u32 = 0,
 };
@@ -61,6 +62,8 @@ fn panelWindows(model: *const PanelModel, scratch: *PanelApp.WindowsScratch) []c
             .height = 240,
             .min_width = 280,
             .min_height = 200,
+            .titlebar = if (model.transparent_settings) .chromeless else .standard,
+            .transparent = model.transparent_settings,
             .on_close = .settings_closed,
         };
         count += 1;
@@ -143,13 +146,17 @@ const Fixture = struct {
 
     /// Deliver the settings window's installing gpu frame.
     fn installSettingsCanvas(self: Fixture, window_id: support.platform.WindowId) !void {
+        try self.dispatchSettingsCanvasFrame(window_id, 1, 2_000_000);
+    }
+
+    fn dispatchSettingsCanvasFrame(self: Fixture, window_id: support.platform.WindowId, frame_index: u64, timestamp_ns: u64) !void {
         try self.harness.runtime.dispatchPlatformEvent(self.app, .{ .gpu_surface_frame = .{
             .window_id = window_id,
             .label = settings_canvas_label,
             .size = geometry.SizeF.init(320, 240),
             .scale_factor = 2,
-            .frame_index = 1,
-            .timestamp_ns = 2_000_000,
+            .frame_index = frame_index,
+            .timestamp_ns = timestamp_ns,
             .nonblank = true,
         } });
     }
@@ -224,6 +231,80 @@ test "a Msg declares the settings window, its canvas installs, and automation dr
     try std.testing.expect(fixture.app_state.model.settings_open);
     const reopened = fixture.settingsWindowInfo() orelse return error.TestUnexpectedResult;
     try std.testing.expect(reopened.open);
+}
+
+test "a transparent descriptor selects premultiplied canvas alpha and an alpha-zero clear" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+
+    fixture.app_state.model.transparent_settings = true;
+    try fixture.clickSettingsButton();
+    const info = fixture.settingsWindowInfo() orelse return error.TestUnexpectedResult;
+
+    const index = for (fixture.harness.null_platform.windows[0..fixture.harness.null_platform.window_count], 0..) |window, i| {
+        if (window.id == info.id) break i;
+    } else return error.WindowNotFound;
+    try std.testing.expect(fixture.harness.null_platform.window_transparent[index]);
+    try std.testing.expectEqual(support.platform.WindowTitlebarStyle.chromeless, fixture.harness.null_platform.window_titlebar[index]);
+
+    var views_buffer: [4]support.platform.ViewInfo = undefined;
+    const views = fixture.harness.runtime.listViews(info.id, &views_buffer);
+    try std.testing.expectEqual(@as(usize, 1), views.len);
+    try std.testing.expectEqualStrings(settings_canvas_label, views[0].label);
+    try std.testing.expectEqual(support.platform.GpuSurfaceAlphaMode.premultiplied, views[0].gpu_alpha_mode);
+
+    // A packet present's completion with no invalidation must idle. Real
+    // hosts schedule this event after every successful present; presenting
+    // it again would create a self-sustaining display-rate loop.
+    try fixture.installSettingsCanvas(info.id);
+    const packet_present_count = fixture.harness.null_platform.gpu_surface_packet_present_count;
+    try fixture.dispatchSettingsCanvasFrame(info.id, 2, 3_000_000);
+    try std.testing.expectEqual(packet_present_count, fixture.harness.null_platform.gpu_surface_packet_present_count);
+
+    // Exercise the pixels-only shape used by Windows' layered-window
+    // compositor after the packet-path idle check.
+    fixture.harness.runtime.options.platform.services.present_gpu_surface_packet_fn = null;
+    fixture.harness.runtime.options.platform.services.present_gpu_surface_packet_binary_fn = null;
+    try fixture.dispatchSettingsCanvasFrame(info.id, 3, 4_000_000);
+    try std.testing.expectEqual(info.id, fixture.harness.null_platform.gpu_surface_present_window_id);
+    try std.testing.expectEqual(@as(u8, 0), fixture.harness.null_platform.gpu_surface_present_sample_rgba[3]);
+    try std.testing.expect(std.mem.indexOfScalar(u8, fixture.app_state.pixel_buffer, 255) != null);
+
+    // The current software-buffer owner also idles after its completion.
+    const idle_pixel_present_count = fixture.harness.null_platform.gpu_surface_present_count;
+    try fixture.dispatchSettingsCanvasFrame(info.id, 4, 5_000_000);
+    try std.testing.expectEqual(idle_pixel_present_count, fixture.harness.null_platform.gpu_surface_present_count);
+
+    // Hand the shared UiApp pixel buffer to the main canvas. Invalidating
+    // only that view models a host/resource full repaint without changing
+    // the secondary canvas's retained summary.
+    fixture.harness.runtime.views[0].presented_canvas_valid = false;
+    try fixture.harness.runtime.dispatchPlatformEvent(fixture.app, .{ .gpu_surface_frame = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .size = geometry.SizeF.init(400, 300),
+        .scale_factor = 2,
+        .frame_index = 2,
+        .timestamp_ns = 6_000_000,
+        .nonblank = true,
+    } });
+    try std.testing.expectEqual(@as(support.platform.WindowId, 1), fixture.harness.null_platform.gpu_surface_present_window_id);
+
+    // The next transparent-slot completion must repaint once after that
+    // ownership handoff, restoring a complete alpha image instead of
+    // presenting the main surface's bytes.
+    @memset(fixture.app_state.pixel_buffer, 0);
+    const handoff_present_count = fixture.harness.null_platform.gpu_surface_present_count;
+    try fixture.dispatchSettingsCanvasFrame(info.id, 5, 7_000_000);
+    try std.testing.expectEqual(handoff_present_count + 1, fixture.harness.null_platform.gpu_surface_present_count);
+    try std.testing.expectEqual(info.id, fixture.harness.null_platform.gpu_surface_present_window_id);
+    try std.testing.expect(std.mem.indexOfScalar(u8, fixture.app_state.pixel_buffer, 255) != null);
+
+    // That one corrective present must not re-arm another present when
+    // the following completion carries no invalidation.
+    const corrected_present_count = fixture.harness.null_platform.gpu_surface_present_count;
+    try fixture.dispatchSettingsCanvasFrame(info.id, 6, 8_000_000);
+    try std.testing.expectEqual(corrected_present_count, fixture.harness.null_platform.gpu_surface_present_count);
 }
 
 test "a user close dispatches on_close and the model owns the consequence" {
@@ -1182,6 +1263,30 @@ test "close_policy .hide on a secondary startup window is refused loudly at star
         var buffer: [support.platform.max_windows]support.platform.WindowInfo = undefined;
         try std.testing.expectEqual(@as(usize, 2), harness.runtime.listWindows(&buffer).len);
     }
+}
+
+test "active immediate secondary startup window becomes the runtime focus owner" {
+    const SourceApp = struct {
+        fn app(self: *@This()) support.App {
+            return .{ .context = self, .name = "startup-focus", .source = support.platform.WebViewSource.html("<p>Startup</p>") };
+        }
+    };
+    const startup_windows = [_]support.platform.WindowOptions{
+        .{ .id = 1, .label = "main", .title = "Main" },
+        .{ .id = 2, .label = "panel", .title = "Panel" },
+    };
+
+    const harness = try core.TestHarness().create(std.testing.allocator, .{ .size = geometry.SizeF.init(400, 300) });
+    defer harness.destroy(std.testing.allocator);
+    harness.runtime.options.platform.app_info.windows = &startup_windows;
+    var app_state: SourceApp = .{};
+    try harness.start(app_state.app());
+
+    var buffer: [support.platform.max_windows]support.platform.WindowInfo = undefined;
+    const windows = harness.runtime.listWindows(&buffer);
+    try std.testing.expectEqual(@as(usize, 2), windows.len);
+    try std.testing.expect(!windows[0].focused);
+    try std.testing.expect(windows[1].focused);
 }
 
 // --------------------- context-menu pin across the window lifecycle

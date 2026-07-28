@@ -321,6 +321,13 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             /// titlebar-control channel's scope, not this field's.
             /// Platforms without the concept keep standard chrome.
             titlebar: app_manifest.WindowTitlebarStyle = .standard,
+            /// Creation-time overlay presentation. These mirror
+            /// `app_manifest.ShellWindow` and are immutable for the life
+            /// of the declared window.
+            transparent: bool = false,
+            always_on_top: bool = false,
+            click_through: bool = false,
+            activate_on_show: bool = true,
             /// Msg dispatched when the USER closes the window (never for
             /// a reconcile close the model itself initiated). The
             /// dismissal precedent: the window is already gone as an
@@ -742,6 +749,11 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             canvas_label_len: usize = 0,
             window_id: platform.WindowId = 0,
             on_close: ?MsgT = null,
+            /// The descriptor's top-level alpha contract also controls
+            /// this slot's gpu alpha mode and frame clear. Without both,
+            /// an alpha-capable native window still receives an opaque
+            /// canvas inherited from the main scene.
+            transparent: bool = false,
             installed: bool = false,
             /// This slot's handler-tree currency (the per-slot half of
             /// `main_tree_current`): false only between handing the
@@ -895,6 +907,12 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// these.
         pixel_buffer: []u8 = &.{},
         pixel_scratch: []u8 = &.{},
+        /// Window whose retained image currently occupies
+        /// `pixel_buffer`. Software presenters consume the entire shared
+        /// buffer even for an incremental frame, so a handoff between
+        /// UiApp surfaces must repaint fully once; consecutive frames for
+        /// the same surface may retain and idle normally.
+        pixel_buffer_window_id: ?platform.WindowId = null,
         /// Worker threads, completion queue, and spawn slots for the
         /// effect system. Fixed-capacity; lives with the app struct
         /// (heap-allocated like the rest of it).
@@ -1297,6 +1315,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             if (self.pixel_scratch.len > 0) self.backing.free(self.pixel_scratch);
             self.pixel_buffer = &.{};
             self.pixel_scratch = &.{};
+            self.pixel_buffer_window_id = null;
         }
 
         pub fn app(self: *Self) App {
@@ -2618,6 +2637,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 .y = descriptor.y,
                 .resizable = descriptor.resizable,
                 .titlebar = descriptor.titlebar,
+                .transparent = descriptor.transparent,
+                .always_on_top = descriptor.always_on_top,
+                .click_through = descriptor.click_through,
+                .activate_on_show = descriptor.activate_on_show,
                 .min_width = descriptor.min_width,
                 .min_height = descriptor.min_height,
                 // Deterministic reopen: the descriptor is the geometry
@@ -2636,6 +2659,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             @memcpy(slot.canvas_label_storage[0..descriptor.canvas_label.len], descriptor.canvas_label);
             slot.window_id = info.id;
             slot.on_close = descriptor.on_close;
+            slot.transparent = descriptor.transparent;
             slot.installed = false;
             slot.canvas_size = .{ .width = descriptor.width, .height = descriptor.height };
             // Until this window's first frame reports its real density,
@@ -2658,7 +2682,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 .kind = .gpu_surface,
                 .fill = true,
             };
-            for (self.options.scene.windows) |window| {
+            scene: for (self.options.scene.windows) |window| {
                 for (window.views) |scene_view| {
                     if (scene_view.kind != .gpu_surface) continue;
                     if (!std.mem.eql(u8, scene_view.label, self.options.canvas_label)) continue;
@@ -2668,9 +2692,13 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                     view.gpu_alpha_mode = scene_view.gpu_alpha_mode;
                     view.gpu_color_space = scene_view.gpu_color_space;
                     view.gpu_vsync = scene_view.gpu_vsync;
-                    return view;
+                    break :scene;
                 }
             }
+            // The top-level alpha flag is sufficient for UiApp windows:
+            // do not inherit the main canvas's ordinary opaque alpha
+            // mode and accidentally erase the desktop behind the slot.
+            if (descriptor.transparent) view.gpu_alpha_mode = .premultiplied;
             return view;
         }
 
@@ -4208,7 +4236,13 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             if (comptime terminal_session.enabled) {
                 _ = self.terminal_sessions.flushPending();
             }
-            try self.presentFrame(runtime, frame_event, self.options.canvas_label, installing);
+            try self.presentFrame(
+                runtime,
+                frame_event,
+                self.options.canvas_label,
+                installing,
+                self.effectiveTokens().colors.background,
+            );
             if (installing) return;
             const on_frame = self.options.on_frame orelse return;
             const gpu_frame = runtime.gpuSurfaceFrame(frame_event.window_id, self.options.canvas_label) catch return;
@@ -4262,7 +4296,14 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 // lands first re-measures all of them.
                 try self.rebuildForRegisteredFonts(runtime);
             }
-            try self.presentFrame(runtime, frame_event, slot.canvasLabel(), installing);
+            var clear_color = self.slotEffectiveTokens(slot).colors.background;
+            if (slot.transparent) clear_color.a = 0;
+            // Packet hosts retain each surface independently. The CPU
+            // fallback shares one UiApp pixel buffer, whose ownership is
+            // handled inside `presentFrame`: a surface handoff repaints
+            // fully once, while an idle completion for the current owner
+            // is allowed to skip.
+            try self.presentFrame(runtime, frame_event, slot.canvasLabel(), installing, clear_color);
         }
 
         /// A face joined the runtime's font registry after this app's
@@ -4293,13 +4334,12 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// reports `UnsupportedService` at present time also falls back to
         /// pixels; that attempt forces a full repaint because the failed
         /// packet plan already recorded the frame's presented summary.
-        fn presentFrame(self: *Self, runtime: *Runtime, frame_event: platform.GpuSurfaceFrameEvent, canvas_label: []const u8, installing: bool) anyerror!void {
-            // The installing frame must paint unconditionally: on software
-            // platforms with no window-manager-driven resizes, nothing else
-            // invalidates before the first present, and the surface would
-            // stay blank until the first input arrives.
+        fn presentFrame(self: *Self, runtime: *Runtime, frame_event: platform.GpuSurfaceFrameEvent, canvas_label: []const u8, force_full_repaint: bool, clear_color: canvas.Color) anyerror!void {
+            // A forced frame must paint unconditionally: the installing
+            // frame has no earlier glass to retain. Software-buffer
+            // ownership below independently forces the first frame after
+            // a surface handoff.
             const services = runtime.options.platform.services;
-            const clear_color = self.effectiveTokens().colors.background;
             var packet_attempted = false;
             if (services.present_gpu_surface_packet_fn != null or services.present_gpu_surface_packet_binary_fn != null) {
                 packet_attempted = true;
@@ -4312,7 +4352,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                             .timestamp_ns = frame_event.timestamp_ns,
                             .surface_size = frame_event.size,
                             .scale = frame_event.scale_factor,
-                            .full_repaint = frame_event.canvas_frame_full_repaint or installing,
+                            .full_repaint = frame_event.canvas_frame_full_repaint or force_full_repaint,
                         },
                         runtime.canvasFrameScratchStorage(),
                         clear_color,
@@ -4329,7 +4369,9 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             }
             if (services.present_gpu_surface_pixels_fn == null) return;
             self.ensurePixelBuffers(frame_event.size, frame_event.scale_factor) catch return;
-            _ = runtime.presentNextCanvasFramePixels(
+            const pixel_buffer_owned = self.pixel_buffer_window_id != null and
+                self.pixel_buffer_window_id.? == frame_event.window_id;
+            const pixel_frame = runtime.presentNextCanvasFramePixels(
                 frame_event.window_id,
                 canvas_label,
                 .{
@@ -4337,16 +4379,20 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                     .timestamp_ns = frame_event.timestamp_ns,
                     .surface_size = frame_event.size,
                     .scale = frame_event.scale_factor,
-                    .full_repaint = frame_event.canvas_frame_full_repaint or packet_attempted or installing,
+                    .full_repaint = frame_event.canvas_frame_full_repaint or
+                        packet_attempted or
+                        force_full_repaint or
+                        !pixel_buffer_owned,
                 },
                 runtime.canvasFrameScratchStorage(),
                 self.pixel_buffer,
                 self.pixel_scratch,
                 clear_color,
             ) catch |err| switch (err) {
-                error.UnsupportedService, error.UnsupportedViewKind => {},
+                error.UnsupportedService, error.UnsupportedViewKind => return,
                 else => return err,
             };
+            if (pixel_frame.requiresRender()) self.pixel_buffer_window_id = frame_event.window_id;
         }
 
         /// Grow the heap pixel buffers to hold the surface at the given
@@ -4354,6 +4400,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         fn ensurePixelBuffers(self: *Self, surface_size: geometry.SizeF, scale_factor: f32) anyerror!void {
             const pixel_size = try canvas_frame.canvasSurfacePixelSize(surface_size, scale_factor);
             if (self.pixel_buffer.len < pixel_size.byte_len) {
+                self.pixel_buffer_window_id = null;
                 if (self.pixel_buffer.len > 0) self.backing.free(self.pixel_buffer);
                 self.pixel_buffer = &.{};
                 self.pixel_buffer = try self.backing.alloc(u8, pixel_size.byte_len);
