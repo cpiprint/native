@@ -2020,7 +2020,7 @@ pub fn RuntimeCanvasWidgetEvents(comptime Runtime: type) type {
         /// and clear-button stamping precedent, made the rule). Before
         /// the stamp, edits that only THIS derivation produced — Escape's
         /// search-field clear, Escape's composition cancel, the
-        /// single-line ArrowUp/Down caret jumps — mutated the editor
+        /// runtime's geometry-aware ArrowUp/Down caret jumps — mutated the editor
         /// while the app-side dispatch re-derived the key on its own and
         /// heard nothing: the field visibly cleared while `model.query`
         /// kept the stale term, and the next keystroke dispatched
@@ -2031,27 +2031,50 @@ pub fn RuntimeCanvasWidgetEvents(comptime Runtime: type) type {
             const index = runtimeFindViewIndex(self, keyboard_event.window_id, keyboard_event.view_label) orelse return;
             if (self.views[index].kind != .gpu_surface) return;
             const target = keyboard_event.target orelse return;
-            const derived = self.views[index].canvasWidgetKeyboardTextEdit(target, keyboard_event.keyboard) orelse return;
-            // Single-line sanitization happens HERE — after derivation,
+            const history_shortcut = if (!keyboard_event.history_replay)
+                self.views[index].canvasWidgetTextHistoryShortcut(target, keyboard_event.keyboard)
+            else
+                null;
+            const derived = if (history_shortcut) |shortcut|
+                shortcut.edit
+            else
+                self.views[index].canvasWidgetKeyboardTextEdit(target, keyboard_event.keyboard) orelse return;
+            if (history_shortcut) |shortcut| {
+                keyboard_event.history_replay = true;
+                keyboard_event.history_replay_serial = shortcut.serial;
+                keyboard_event.history_replay_redo = shortcut.redo;
+            }
+            // New single-line input is sanitized HERE — after derivation,
             // BEFORE the stamp — so the retained editor and the app's
-            // `on_input` mirror hear byte-identical sanitized inserts
-            // (clipboard paste from both entry points, typed and
-            // automation text_input, IME composition — every insertion
-            // source flows through this one seam). Pre-stamped pastes
-            // arrive already sanitized (`clampCanvasWidgetPasteText`
-            // strips BEFORE clamping so capacity never counts stripped
-            // bytes); re-sanitizing them is a no-op. A suppressed edit (an
-            // insert that was ONLY line breaks) also clears any raw
-            // pre-stamped paste so the app can never hear bytes the
-            // editor refused; the app-side fallback derivation applies
-            // the same sanitize rule, so both derivations still agree.
-            const edit = canvas.sanitizedSingleLineTextInputEvent(target.kind, derived) orelse {
-                keyboard_event.keyboard.edit = null;
-                return;
-            };
+            // `on_input` mirror hear byte-identical sanitized inserts.
+            // Clipboard paste, typed and automation text_input, and IME
+            // composition all flow through this seam. History replay is
+            // the deliberate exception below: its payload is retained
+            // state rather than new input.
+            // History payloads are retained bytes, not new user input:
+            // replay them exactly so Undo can restore a model-provided
+            // single-line value that contains raw line breaks. Every
+            // non-history insertion still crosses the sanitizer below.
+            const edit = if (keyboard_event.history_replay)
+                derived
+            else
+                canvas.sanitizedSingleLineTextInputEvent(target.kind, derived) orelse {
+                    keyboard_event.keyboard.edit = null;
+                    return;
+                };
             keyboard_event.keyboard.edit = edit;
 
-            const dirty = try self.views[index].applyCanvasWidgetTextEdit(target.id, edit) orelse return;
+            const dirty = if (keyboard_event.history_replay)
+                try self.views[index].applyCanvasWidgetTextEditWithoutHistory(target.id, edit) orelse return
+            else
+                try self.views[index].applyCanvasWidgetTextEdit(target.id, edit) orelse return;
+            if (keyboard_event.history_replay) {
+                self.views[index].commitCanvasWidgetTextHistoryReplayIfComplete(
+                    target,
+                    keyboard_event.history_replay_serial,
+                    keyboard_event.history_replay_redo,
+                );
+            }
             if (canvasDirtyRegionForView(self.views[index].frame, dirty)) |dirty_region| {
                 self.invalidateFor(.state, dirty_region);
             } else {
@@ -2102,6 +2125,7 @@ pub fn RuntimeCanvasWidgetEvents(comptime Runtime: type) type {
                 target_id,
                 pointer_event.pointer.point,
                 pointer_event.pointer.phase == .move,
+                pointer_event.pointer.phase == .down and pointer_event.pointer.modifiers.shift,
                 pointer_event.pointer.click_count,
             );
             // Pointer placement lives first in the retained editor, but a

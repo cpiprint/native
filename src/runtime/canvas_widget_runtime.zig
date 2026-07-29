@@ -151,6 +151,12 @@ pub const CanvasWidgetTextReconcileEntry = struct {
     text: []const u8 = &.{},
     source_text_len: usize = 0,
     source_text_hash: u64 = 0,
+    /// The selection declared by the previous SOURCE tree, distinct from
+    /// the runtime-owned selection in `text_selection`. Legacy controlled
+    /// models always materialize the default `.upstream` affinity, so an
+    /// unchanged source affinity is an echo; a changed affinity is an
+    /// explicit source-side visual-caret move.
+    source_text_selection: ?canvas.TextSelection = null,
     text_selection: ?canvas.TextSelection = null,
     text_composition: ?canvas.TextRange = null,
     value: f32 = 0,
@@ -246,6 +252,7 @@ pub const CanvasWidgetSourceTextEntry = struct {
     kind: canvas.WidgetKind = .text_field,
     text_len: usize = 0,
     text_hash: u64 = 0,
+    text_selection: ?canvas.TextSelection = null,
 };
 
 /// The SOURCE-side selected state (and value, for sliders) of one
@@ -588,13 +595,18 @@ pub fn collectCanvasWidgetTextReconcileEntries(
         if (node.widget.id == 0 or !canvasWidgetTextReconcileKind(node.widget)) continue;
         if (len >= output.len) break;
         const text_range = try appendWidgetTextStorageRange(text_storage, text_len, node.widget.text);
-        const source_text = canvasWidgetSourceTextByIdKind(source_entries, node.widget.id, node.widget.kind) orelse canvasWidgetSourceTextFingerprint(node.widget.text);
+        const source_entry = canvasWidgetSourceTextEntryByIdKind(source_entries, node.widget.id, node.widget.kind);
+        const source_text = if (source_entry) |entry|
+            CanvasWidgetSourceTextFingerprint{ .len = entry.text_len, .hash = entry.text_hash }
+        else
+            canvasWidgetSourceTextFingerprint(node.widget.text);
         output[len] = .{
             .id = node.widget.id,
             .kind = node.widget.kind,
             .text = text_storage[text_range.start..text_range.end],
             .source_text_len = source_text.len,
             .source_text_hash = source_text.hash,
+            .source_text_selection = if (source_entry) |entry| entry.text_selection else null,
             .text_selection = node.widget.text_selection,
             .text_composition = node.widget.text_composition,
             .value = node.widget.value,
@@ -632,12 +644,21 @@ pub fn canvasWidgetSourceTextByIdKind(
     id: canvas.ObjectId,
     kind: canvas.WidgetKind,
 ) ?CanvasWidgetSourceTextFingerprint {
+    const entry = canvasWidgetSourceTextEntryByIdKind(entries, id, kind) orelse return null;
+    return .{
+        .len = entry.text_len,
+        .hash = entry.text_hash,
+    };
+}
+
+fn canvasWidgetSourceTextEntryByIdKind(
+    entries: []const CanvasWidgetSourceTextEntry,
+    id: canvas.ObjectId,
+    kind: canvas.WidgetKind,
+) ?CanvasWidgetSourceTextEntry {
     for (entries) |entry| {
         if (entry.id != id or entry.kind != kind) continue;
-        return .{
-            .len = entry.text_len,
-            .hash = entry.text_hash,
-        };
+        return entry;
     }
     return null;
 }
@@ -755,8 +776,10 @@ pub fn canvasWidgetLayoutNodeWithTextReconcileState(
     previous: *const CanvasWidgetTextEntryIndex,
 ) canvas.WidgetLayoutNode {
     var copy = node;
-    if (copy.widget.id == 0) return copy;
-    if (copy.widget.state.disabled or canvasWidgetLayoutNodeHidden(layout, node_index)) return copy;
+    if (copy.widget.id == 0) return canvasWidgetLayoutNodeWithCaretSafeSelection(copy);
+    if (copy.widget.state.disabled or canvasWidgetLayoutNodeHidden(layout, node_index)) {
+        return canvasWidgetLayoutNodeWithCaretSafeSelection(copy);
+    }
 
     if (copy.widget.kind == .text) {
         // Static text selections survive rebuilds only while the source
@@ -766,7 +789,7 @@ pub fn canvasWidgetLayoutNodeWithTextReconcileState(
                 copy.widget.text_selection = entry.text_selection;
             }
         }
-        return copy;
+        return canvasWidgetLayoutNodeWithCaretSafeSelection(copy);
     }
     if (!canvasWidgetEditableTextKind(copy.widget.kind)) return copy;
 
@@ -780,7 +803,9 @@ pub fn canvasWidgetLayoutNodeWithTextReconcileState(
         const next_source_text = canvasWidgetSourceTextFingerprint(copy.widget.text);
         const source_unchanged = entry.source_text_len == next_source_text.len and entry.source_text_hash == next_source_text.hash;
         const source_matches_runtime_text = std.mem.eql(u8, entry.text, copy.widget.text);
-        if (!source_unchanged and !source_matches_runtime_text) return copy;
+        if (!source_unchanged and !source_matches_runtime_text) {
+            return canvasWidgetLayoutNodeWithCaretSafeSelection(copy);
+        }
         if (source_unchanged) copy.widget.text = entry.text;
         // The retained scroll offset rides `value` for every editable
         // text kind: the textarea's vertical offset and the single-line
@@ -792,7 +817,39 @@ pub fn canvasWidgetLayoutNodeWithTextReconcileState(
         if (copy.widget.text_selection == null and copy.widget.text_composition == null) {
             copy.widget.text_selection = entry.text_selection;
             copy.widget.text_composition = entry.text_composition;
+        } else if (copy.widget.text_selection) |*source_selection| {
+            // Caret affinity is runtime geometry at a byte offset. Core
+            // and C-ABI controlled models historically echo only
+            // anchor/focus, so the bridge materializes `.upstream` on
+            // every rebuild. When those offsets faithfully echo the
+            // retained selection, keep the retained visual-line owner;
+            // changing either offset remains the source-authoritative
+            // way to move the selection.
+            if (entry.text_selection) |retained_selection| {
+                if (source_selection.anchor == retained_selection.anchor and
+                    source_selection.focus == retained_selection.focus)
+                {
+                    const source_affinity_changed = if (entry.source_text_selection) |previous_source_selection|
+                        source_selection.affinity != previous_source_selection.affinity
+                    else
+                        // The legacy shape can only materialize upstream;
+                        // a first downstream value is therefore explicit.
+                        source_selection.affinity != .upstream;
+                    if (!source_affinity_changed) {
+                        source_selection.affinity = retained_selection.affinity;
+                    }
+                }
+            }
         }
+    }
+    return canvasWidgetLayoutNodeWithCaretSafeSelection(copy);
+}
+
+fn canvasWidgetLayoutNodeWithCaretSafeSelection(node: canvas.WidgetLayoutNode) canvas.WidgetLayoutNode {
+    var copy = node;
+    if (!canvasWidgetEditableTextKind(copy.widget.kind)) return copy;
+    if (copy.widget.text_selection) |selection| {
+        copy.widget.text_selection = canvas.snapTextCaretSelection(copy.widget.text, selection);
     }
     return copy;
 }
@@ -1174,7 +1231,7 @@ pub fn canvasWidgetTextEditUnchanged(previous: canvas.TextEditState, next: canva
 }
 
 pub fn canvasTextSelectionsEqual(a: canvas.TextSelection, b: canvas.TextSelection) bool {
-    return a.anchor == b.anchor and a.focus == b.focus;
+    return a.anchor == b.anchor and a.focus == b.focus and a.affinity == b.affinity;
 }
 
 pub fn textSelectionCollapsedAt(selection: ?canvas.TextSelection, offset: usize) bool {

@@ -174,6 +174,7 @@ pub fn RuntimeViewCanvasWidgetTree(comptime RuntimeView: type) type {
                     .kind = node.widget.kind,
                     .text_len = source_text.len,
                     .text_hash = source_text.hash,
+                    .text_selection = node.widget.text_selection,
                 };
                 entry_count += 1;
             }
@@ -349,6 +350,7 @@ pub fn RuntimeViewCanvasWidgetTree(comptime RuntimeView: type) type {
             if (self.canvas_widget_pressed_id != 0 and !canvasWidgetInteractionTargetExists(self.widgetLayoutTree(), self.canvas_widget_pressed_id)) {
                 self.canvas_widget_pressed_id = 0;
             }
+            self.pruneCanvasWidgetTextHistory();
             self.canvas_widget_cursor = self.canvasWidgetCursorForId(self.canvas_widget_hovered_id);
             self.widget_revision += 1;
         }
