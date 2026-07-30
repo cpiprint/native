@@ -357,6 +357,7 @@ pub const ColorContrast = token_model.ColorContrast;
 pub const ThemeOptions = token_model.ThemeOptions;
 pub const ThemePack = token_model.ThemePack;
 pub const ColorTokens = token_model.ColorTokens;
+pub const colorTokenValue = token_model.colorTokenValue;
 pub const FontFamily = token_model.FontFamily;
 pub const TypographyTokens = token_model.TypographyTokens;
 pub const SpacingTokens = token_model.SpacingTokens;
@@ -530,8 +531,9 @@ pub const max_chart_axis_ticks = chart.max_chart_axis_ticks;
 pub const chartPointCount = chart.chartPointCount;
 pub const chartHoverIndex = chart.chartHoverIndex;
 
-// GitHub-flavored-markdown mapper (markdown source -> widget tree + span
-// model) lives in `markdown.zig`; also exported as `native_sdk.markdown`.
+// Shared source-code lexer/presentation model and GitHub-flavored-markdown
+// mapper. Markdown fenced blocks lower through `Ui.code`.
+pub const code = @import("code.zig");
 pub const markdown = @import("markdown.zig");
 
 // Deterministic key-lookup scratch shared by the per-frame planners and

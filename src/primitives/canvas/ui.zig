@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const code_model = @import("code.zig");
 const font_coverage = @import("font_coverage.zig");
 const geometry = @import("geometry");
 const canvas = @import("root.zig");
@@ -383,9 +384,7 @@ pub const StyleTokenRefs = struct {
 };
 
 fn colorTokenValue(colors: canvas.ColorTokens, ref: ColorTokenName) canvas.Color {
-    return switch (ref) {
-        inline else => |tag| @field(colors, @tagName(tag)),
-    };
+    return canvas.colorTokenValue(colors, ref);
 }
 
 fn radiusTokenValue(radius: canvas.RadiusTokens, ref: RadiusTokenName) f32 {
@@ -937,6 +936,11 @@ pub fn Ui(comptime Msg: type) type {
             on_terminal: ?TerminalMsgFn = null,
             context_menu: []const ContextMenuItem = &.{},
             nodes: []const Node = &.{},
+            /// Internal source fingerprint for adjacent code paragraphs
+            /// that form one selectable document. `finalizeNode` combines
+            /// it with their parent structural id into a source-sensitive
+            /// group identity.
+            static_text_group_fingerprint: u64 = 0,
             /// Markup authoring provenance, stamped by the markup engines
             /// when the builder carries a `provenance_sink`; null for
             /// builder-authored (Zig) nodes, which is itself the honest
@@ -2289,6 +2293,292 @@ pub fn Ui(comptime Msg: type) type {
             return self.el(.stack, .{ .grow = grow }, .{});
         }
 
+        pub const CodeOptions = struct {
+            key: ?UiKey = null,
+            global_key: ?UiKey = null,
+            language: code_model.Language = .plain,
+            /// Prefix each logical source line with a muted, monospace
+            /// number. Off by default.
+            line_numbers: bool = false,
+            /// Word-wrap long source lines. `false` keeps logical lines
+            /// intact inside one horizontal scroll region.
+            wrap: bool = true,
+            width: f32 = 0,
+            /// Definite surface height. Overflow scrolls vertically;
+            /// no-wrap surfaces scroll on both axes.
+            height: f32 = 0,
+            min_width: f32 = 0,
+            grow: f32 = 0,
+            semantics: canvas.WidgetSemantics = .{},
+        };
+
+        /// A themed source-code surface with bounded syntax highlighting.
+        /// Markdown fences lower through this same component.
+        pub fn code(self: *Self, options: CodeOptions, source: []const u8) Node {
+            const line_count = codeLineCount(source);
+            const numbered = options.line_numbers and line_count <= max_code_lines;
+            const content = if (numbered)
+                self.numberedCodeParagraph(source, options.language, options.wrap, line_count)
+            else
+                self.codeParagraphChunks(source, options.language, options.wrap);
+            const body = if (options.wrap)
+                if (options.height > 0) blk: {
+                    // Generic scroll children stay viewport-sized by
+                    // contract. Put code in an internal flow track whose
+                    // non-growing paragraph retains its full wrapped
+                    // height, giving the vertical scroll walker an honest
+                    // descendant extent without remeasuring arbitrary
+                    // public scroll content.
+                    var tracked_content = content;
+                    tracked_content.widget.layout.grow = 0;
+                    const track = self.column(.{}, .{tracked_content});
+                    break :blk self.scroll(.{ .axis = .vertical, .grow = 1 }, .{track});
+                } else content
+            else blk: {
+                // The engine scrollbar overlays the viewport's bottom
+                // edge. Reserve one quiet band inside the scrollable
+                // track so the final code baseline never sits under it.
+                const track = self.column(.{}, .{
+                    content,
+                    self.el(.stack, .{ .height = 8 }, .{}),
+                });
+                break :blk self.scroll(.{
+                    .axis = if (options.height > 0) .both else .horizontal,
+                    .grow = 1,
+                }, .{track});
+            };
+            var surface = self.el(.panel, .{
+                .key = options.key,
+                .global_key = options.global_key,
+                .width = options.width,
+                .height = options.height,
+                .min_width = options.min_width,
+                .grow = options.grow,
+                .padding = 12,
+                .style_tokens = .{ .background = .surface_subtle },
+                .semantics = options.semantics,
+            }, .{body});
+            surface.widget.layout.clip_content = true;
+            return surface;
+        }
+
+        /// Keep numbered source in one selectable paragraph. The renderer
+        /// owns its muted gutter, so marker digits never enter retained
+        /// text or clipboard bytes; it derives each marker baseline from
+        /// this paragraph's real wrapped layout.
+        fn numberedCodeParagraph(
+            self: *Self,
+            source: []const u8,
+            language: code_model.Language,
+            wrap: bool,
+            line_count: usize,
+        ) Node {
+            var state: code_model.HighlightState = .{};
+            var source_node = self.codeParagraphWithState(source, language, wrap, 1, &state, null);
+            source_node.widget.code_line_number_digits = @intCast(decimalDigits(line_count));
+            return source_node;
+        }
+
+        /// Keep ordinary code in one text widget so static selection and copy
+        /// span logical lines. Only split when the paragraph layout's bounded
+        /// line capacity requires it; every chunk remains independently
+        /// visible instead of silently truncating a large source block.
+        fn codeParagraphChunks(self: *Self, source: []const u8, language: code_model.Language, wrap: bool) Node {
+            var state: code_model.HighlightState = .{};
+            var budget: CodeSpanBudget = .{
+                .remaining_chunks = codeParagraphChunkCount(source, wrap),
+            };
+            return self.codeParagraphChunksWithStateBudgeted(
+                source,
+                language,
+                wrap,
+                if (wrap) 1 else 0,
+                &state,
+                &budget,
+            );
+        }
+
+        fn codeParagraphChunksWithState(
+            self: *Self,
+            source: []const u8,
+            language: code_model.Language,
+            wrap: bool,
+            grow: f32,
+            state: *code_model.HighlightState,
+        ) Node {
+            return self.codeParagraphChunksWithStateBudgeted(
+                source,
+                language,
+                wrap,
+                grow,
+                state,
+                null,
+            );
+        }
+
+        fn codeParagraphChunksWithStateBudgeted(
+            self: *Self,
+            source: []const u8,
+            language: code_model.Language,
+            wrap: bool,
+            grow: f32,
+            state: *code_model.HighlightState,
+            budget: ?*CodeSpanBudget,
+        ) Node {
+            const chunk_count = codeParagraphChunkCount(source, wrap);
+            if (chunk_count == 1) {
+                return self.codeParagraphWithState(source, language, wrap, grow, state, budget);
+            }
+            const chunks = self.arena.alloc(Node, chunk_count) catch {
+                self.failed = true;
+                return self.column(.{}, .{});
+            };
+            const group_fingerprint = std.hash.Wyhash.hash(0, source) | 1;
+            var chunk_index: usize = 0;
+            var chunk_start: usize = 0;
+            while (chunk_start < source.len) {
+                const chunk_end = codeParagraphChunkEnd(source, chunk_start, wrap);
+                chunks[chunk_index] = self.codeParagraphWithState(
+                    source[chunk_start..chunk_end],
+                    language,
+                    wrap,
+                    0,
+                    state,
+                    budget,
+                );
+                chunks[chunk_index].static_text_group_fingerprint = group_fingerprint;
+                chunks[chunk_index].widget.static_text_group_offset = chunk_start;
+                chunk_index += 1;
+                chunk_start = chunk_end;
+            }
+            return self.column(.{ .grow = grow }, .{chunks[0..chunk_index]});
+        }
+
+        fn codeParagraphWithState(
+            self: *Self,
+            source: []const u8,
+            language: code_model.Language,
+            wrap: bool,
+            grow: f32,
+            state: *code_model.HighlightState,
+            budget: ?*CodeSpanBudget,
+        ) Node {
+            var storage: [canvas.text_spans.max_text_spans_per_paragraph]canvas.TextSpan = undefined;
+            var highlighted = if (source.len == 0) blk: {
+                storage[0] = .{ .text = source, .monospace = true, .color = .syntax_plain };
+                break :blk storage[0..1];
+            } else code_model.highlightWithState(source, language, &storage, state);
+            if (budget) |span_budget| {
+                std.debug.assert(span_budget.remaining_chunks > 0);
+                span_budget.remaining_chunks -= 1;
+                const highlighted_total = span_budget.used +
+                    highlighted.len +
+                    span_budget.remaining_chunks;
+                if (highlighted_total <= max_code_spans_per_surface) {
+                    span_budget.used += highlighted.len;
+                } else {
+                    storage[0] = .{
+                        .text = source,
+                        .monospace = true,
+                        .color = .syntax_plain,
+                    };
+                    highlighted = storage[0..1];
+                    span_budget.used += 1;
+                }
+            }
+            return self.paragraph(.{ .wrap = wrap, .grow = grow }, highlighted);
+        }
+
+        /// Upper bound for formatting renderer-owned logical-line markers.
+        /// Sources above it keep every source byte and omit the gutter.
+        pub const max_code_lines: usize = 128;
+        pub const max_code_spans_per_surface: usize = 512;
+
+        const CodeSpanBudget = struct {
+            used: usize = 0,
+            remaining_chunks: usize,
+        };
+
+        fn codeParagraphChunkCount(source: []const u8, wrap: bool) usize {
+            if (source.len == 0) return 1;
+            var count: usize = 0;
+            var start: usize = 0;
+            while (start < source.len) {
+                start = codeParagraphChunkEnd(source, start, wrap);
+                count += 1;
+            }
+            return count;
+        }
+
+        /// Pack complete logical lines while their UTF-8 scalar count fits
+        /// the span layout's worst case (one glyph per visual line). A
+        /// single over-capacity logical line stays whole: the viewport
+        /// painter pages its visual runs without inserting a source break.
+        fn codeParagraphChunkEnd(source: []const u8, start: usize, wrap: bool) usize {
+            if (!wrap) {
+                var cursor = start;
+                var lines: usize = 0;
+                while (cursor < source.len) : (cursor += 1) {
+                    if (source[cursor] != '\n') continue;
+                    lines += 1;
+                    if (lines >= max_code_logical_lines_per_paragraph and cursor + 1 < source.len) {
+                        return cursor + 1;
+                    }
+                }
+                return source.len;
+            }
+
+            var cursor = start;
+            var units: usize = 0;
+            var lines: usize = 0;
+            while (cursor < source.len) {
+                const newline = std.mem.indexOfScalarPos(u8, source, cursor, '\n');
+                const line_end = newline orelse source.len;
+                const after_line = if (newline != null) line_end + 1 else line_end;
+                // A trailing newline ends the final painted line without
+                // adding another one. An empty source line still occupies
+                // one visual line.
+                const line_units = @max(1, codeScalarCount(source[cursor..line_end]));
+                if (units + line_units > canvas.text_spans.max_text_span_lines_per_paragraph and cursor > start) {
+                    return cursor;
+                }
+                units += line_units;
+                lines += 1;
+                cursor = after_line;
+                if (lines >= max_code_logical_lines_per_paragraph and cursor < source.len) return cursor;
+            }
+            return source.len;
+        }
+
+        fn codeScalarCount(source: []const u8) usize {
+            var count: usize = 0;
+            var cursor: usize = 0;
+            while (cursor < source.len) : (count += 1) {
+                const sequence_len = std.unicode.utf8ByteSequenceLength(source[cursor]) catch 1;
+                cursor += @min(sequence_len, source.len - cursor);
+            }
+            return count;
+        }
+
+        // Keep the maximal 64 KiB newline-only source within both the
+        // component's 512-span share and the runtime's 1024-node view cap:
+        // 128 logical lines per paragraph yields at most 512 chunks.
+        const max_code_logical_lines_per_paragraph: usize =
+            canvas.text_spans.max_text_span_lines_per_paragraph;
+
+        fn codeLineCount(source: []const u8) usize {
+            if (source.len == 0) return 1;
+            return std.mem.count(u8, source, "\n") +
+                @intFromBool(source[source.len - 1] != '\n');
+        }
+
+        fn decimalDigits(value: usize) usize {
+            var remaining = value;
+            var digits: usize = 1;
+            while (remaining >= 10) : (remaining /= 10) digits += 1;
+            return digits;
+        }
+
         pub const ChartOptions = struct {
             key: ?UiKey = null,
             global_key: ?UiKey = null,
@@ -2889,14 +3179,23 @@ pub fn Ui(comptime Msg: type) type {
             // way, matching the single-line measurement both layout paths
             // already perform; overflow policy (`overflow`, trailing
             // ellipsis by default) decides what happens past the frame.
-            // Span paragraphs keep wrapping.
-            if (node.wrap == false and widget.kind == .text and widget.spans.len == 0) {
+            // Span paragraphs honor the same explicit no-wrap policy.
+            // `Ui.code` uses this to keep highlighted logical lines
+            // intact inside its horizontal scroll region.
+            if (node.wrap == false and widget.kind == .text) {
                 widget.text_no_wrap = true;
             }
             widget.id = if (node.global_key) |global_key|
                 structuralId(global_id_seed, widget.kind, global_key)
             else
                 structuralId(parent_id, widget.kind, key);
+            if (node.static_text_group_fingerprint != 0) {
+                widget.static_text_group_id = structuralId(
+                    parent_id,
+                    .stack,
+                    .{ .int = node.static_text_group_fingerprint },
+                );
+            }
             // Provenance record (write-back's read half): this is the one
             // point where the markup-stamped source and the just-assigned
             // structural id are both in hand. Explicit keys (loop item

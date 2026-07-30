@@ -353,6 +353,11 @@ pub const elements = [_]ElementInfo{
     // owns the keyboard, so it must carry a name — the runtime then
     // announces the live screen text as its content.
     .{ .code = 69, .name = "terminal", .widget_kind = "terminal", .a11y_name = .control },
+    // The reusable code surface: a source-bound composite that lowers
+    // through `Ui.code` to a highlighted panel, optionally with logical
+    // line numbers or one horizontal scroll region for unwrapped lines.
+    // Markdown fences use the same builder component.
+    .{ .code = 70, .name = "code", .rule_hook = "code", .hit_target = false },
 };
 
 // ------------------------------------------------------------- attributes
@@ -553,6 +558,11 @@ pub const attrs = [_]AttrInfo{
     // back here and user scrollback survives rebuilds; move it
     // model-side to scroll programmatically. 0 is pinned to the bottom.
     .{ .code = 89, .name = "scrollback", .class = .whole, .group = .option, .field = "scrollback" },
+    // Code-surface declarations (the <code> composite; its rule hook
+    // owns the closed set). Language is a literal lexer name and line
+    // numbers are opt-in; wrapping reuses generic attr code 16.
+    .{ .code = 90, .name = "language", .class = .option, .group = .composite },
+    .{ .code = 91, .name = "line-numbers", .class = .flag, .group = .composite },
 };
 
 // ----------------------------------------------------------------- events
@@ -597,12 +607,13 @@ pub const events = [_]EventInfo{
 // tests in ui_markup_view_tests.zig hold them equal to the live structs).
 
 pub const color_token_names = [_][]const u8{
-    "background",   "surface",     "surface_subtle",   "surface_pressed",
-    "text",         "text_muted",  "border",           "accent",
-    "accent_text",  "destructive", "destructive_text", "success",
-    "success_text", "warning",     "warning_text",     "info",
-    "info_text",    "focus_ring",  "shadow",           "scrim",
-    "disabled",
+    "background",      "surface",          "surface_subtle",  "surface_pressed",
+    "text",            "text_muted",       "syntax_plain",    "syntax_comment",
+    "syntax_keyword",  "syntax_literal",   "syntax_function", "syntax_property",
+    "syntax_constant", "border",           "accent",          "accent_text",
+    "destructive",     "destructive_text", "success",         "success_text",
+    "warning",         "warning_text",     "info",            "info_text",
+    "focus_ring",      "shadow",           "scrim",           "disabled",
 };
 
 pub const radius_token_names = [_][]const u8{ "sm", "md", "lg", "xl" };

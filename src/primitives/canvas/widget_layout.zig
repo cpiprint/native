@@ -42,6 +42,7 @@ const widgetControlInset = widget_metrics.widgetControlInset;
 const widgetSizedDensityValue = widget_metrics.widgetSizedDensityValue;
 const densityValue = widget_metrics.densityValue;
 const widgetControlHeight = widget_metrics.widgetControlHeight;
+const widgetCodeLineNumberGutterWidth = widget_metrics.widgetCodeLineNumberGutterWidth;
 const widgetStatusBarPadding = widget_render.widgetStatusBarPadding;
 const controlStrokeWidth = widget_render.controlStrokeWidth;
 const componentControlVisualTokens = widget_render.componentControlVisualTokens;
@@ -103,7 +104,7 @@ pub fn layoutWidgetDepth(
         .scroll_view => if (widget.layout.virtualized)
             try layoutVirtualVerticalChildren(widget.children, content, index, depth, output, len, widget.value, widget.layout, tokens)
         else
-            try layoutScrollChildren(widget.children, content, index, depth, output, len, scrollLayoutOffset(widget), tokens),
+            try layoutScrollChildren(widget.children, content, index, depth, output, len, widget.scroll_axes, scrollLayoutOffset(widget), tokens),
         .list => if (widget.layout.virtualized)
             try layoutVirtualVerticalChildren(widget.children, content, index, depth, output, len, widget.value, widget.layout, tokens)
         else
@@ -825,7 +826,11 @@ fn rowChildWidth(row: Widget, available_width: f32, index: usize, tokens: Design
 fn spanParagraphHeight(widget: Widget, width: f32, tokens: DesignTokens) f32 {
     return text_spans_model.textSpansWrappedHeight(
         widget.spans,
-        widgetTextSpanLayoutOptions(widget, tokens, width),
+        widgetTextSpanLayoutOptions(
+            widget,
+            tokens,
+            @max(0, width - widgetCodeLineNumberGutterWidth(widget, tokens)),
+        ),
     );
 }
 
@@ -836,7 +841,7 @@ fn spanParagraphHeight(widget: Widget, width: f32, tokens: DesignTokens) f32 {
 /// an empty frame (never hit-testable).
 fn layoutTextSpanLinkChildren(
     widget: Widget,
-    content: geometry.RectF,
+    raw_content: geometry.RectF,
     parent_index: usize,
     depth: usize,
     output: []WidgetLayoutNode,
@@ -845,6 +850,12 @@ fn layoutTextSpanLinkChildren(
 ) Error!void {
     if (widget.children.len == 0) return;
     if (widget.spans.len == 0) return;
+    var content = raw_content;
+    if (widget.kind == .text) {
+        const gutter = @min(content.width, widgetCodeLineNumberGutterWidth(widget, tokens));
+        content.x += gutter;
+        content.width -= gutter;
+    }
 
     var runs: [text_spans_model.max_text_span_runs_per_paragraph]text_spans_model.TextSpanRun = undefined;
     const layout = text_spans_model.layoutTextSpans(
@@ -1051,13 +1062,22 @@ fn layoutScrollChildren(
     depth: usize,
     output: []WidgetLayoutNode,
     len: *usize,
+    axes: canvas.ScrollAxes,
     scroll_offset: geometry.OffsetF,
     tokens: DesignTokens,
 ) Error!void {
     const scrolled_content = content.translate(geometry.OffsetF.init(-scroll_offset.dx, -scroll_offset.dy));
     for (children) |child| {
         if (child.layout.anchor != null) continue;
-        _ = try layoutWidgetDepth(child, stackChildFrame(scrolled_content, child), parent_index, depth + 1, output, len, tokens);
+        var child_frame = stackChildFrame(scrolled_content, child);
+        // A `both` region must retain the same intrinsic width as a
+        // horizontal-only shelf; otherwise its horizontal axis has no
+        // content range even when its child paints a long no-wrap line.
+        if (axes.scrollsHorizontally() and child.frame.width <= 0) {
+            const intrinsic = intrinsicChildSize(child, tokens, depth + 1);
+            child_frame.width = @max(child_frame.width, intrinsic.width);
+        }
+        _ = try layoutWidgetDepth(child, child_frame, parent_index, depth + 1, output, len, tokens);
     }
 }
 
@@ -1615,8 +1635,11 @@ fn intrinsicWidgetSizeDepth(widget: Widget, tokens: DesignTokens, depth: usize) 
         .dialog, .drawer, .sheet => intrinsicModalSurfaceWidgetSize(widget, tokens, depth),
         // Containers measure their children (matching the stacking axis the
         // layout pass uses), bounded by the widget depth cap. Scroll
-        // viewports and virtualized containers stay zero: their content is
-        // allowed to overflow the space they're given.
+        // viewports and virtualized containers stay zero on each axis they
+        // scroll: their content is allowed to overflow the space they're
+        // given. A horizontal-only viewport still reports its child's
+        // height, so an inline code scroller hugs its rows instead of
+        // collapsing to a zero-height clip.
         .row, .breadcrumb, .button_group, .pagination, .radio_group, .tabs, .toggle_group => intrinsicAxisChildrenSize(widget, tokens, .horizontal, depth),
         .column, .menu_surface, .dropdown_menu, .input_group => intrinsicAxisChildrenSize(widget, tokens, .vertical, depth),
         .list, .data_grid, .table => if (widget.layout.virtualized)
@@ -1640,7 +1663,10 @@ fn intrinsicWidgetSizeDepth(widget: Widget, tokens: DesignTokens, depth: usize) 
         // Terminals join them: the grid derives its cols/rows FROM the
         // space it is given (the runtime resizes the pty to fit), so
         // reporting an intrinsic size would invert the contract.
-        .scroll_view, .image, .split, .media_surface, .terminal => geometry.SizeF.zero(),
+        .scroll_view => if (!widget.layout.virtualized and widget.scroll_axes == .horizontal) blk: {
+            break :blk intrinsicHorizontalScrollSize(widget, tokens, depth);
+        } else geometry.SizeF.zero(),
+        .image, .split, .media_surface, .terminal => geometry.SizeF.zero(),
     };
 }
 
@@ -1723,6 +1749,28 @@ fn intrinsicOverlayChildrenSize(widget: Widget, tokens: DesignTokens, depth: usi
     return paddedIntrinsicSize(widget, geometry.SizeF.init(width_max, height_max));
 }
 
+/// A horizontal viewport stays width-neutral but hugs the full vertical
+/// extent of its unwrapped content. Span paragraphs report a one-line
+/// intrinsic height, so measure each child through the width-aware seam at
+/// its natural width; explicit newlines then contribute every painted row.
+fn intrinsicHorizontalScrollSize(widget: Widget, tokens: DesignTokens, depth: usize) geometry.SizeF {
+    if (depth >= max_widget_depth or widget.children.len == 0) {
+        return geometry.SizeF.init(0, intrinsicOwnMinSize(widget).height);
+    }
+    var height_max: f32 = 0;
+    for (widget.children) |child| {
+        if (child.layout.anchor != null) continue;
+        const intrinsic = intrinsicChildSize(child, tokens, depth + 1);
+        const child_width = if (child.frame.width > 0) child.frame.width else intrinsic.width;
+        height_max = @max(
+            height_max,
+            wrappedVerticalExtentForWidth(child, child_width, tokens, depth + 1),
+        );
+    }
+    const padded = paddedIntrinsicSize(widget, geometry.SizeF.init(0, height_max));
+    return geometry.SizeF.init(0, padded.height);
+}
+
 fn intrinsicGridChildrenSize(widget: Widget, tokens: DesignTokens, depth: usize) geometry.SizeF {
     if (depth >= max_widget_depth or widget.children.len == 0) return intrinsicOwnMinSize(widget);
     var cell_width: f32 = 0;
@@ -1761,7 +1809,8 @@ fn intrinsicTextWidgetSize(widget: Widget, tokens: DesignTokens, text_size: f32)
     if (widgetIsSpanParagraph(widget)) {
         const options = widgetTextSpanLayoutOptions(widget, tokens, 0);
         return geometry.SizeF.init(
-            text_spans_model.textSpansIntrinsicWidth(widget.spans, options),
+            text_spans_model.textSpansIntrinsicWidth(widget.spans, options) +
+                widgetCodeLineNumberGutterWidth(widget, tokens),
             widgetLineHeight(text_size * text_spans_model.textSpansMaxScale(widget.spans)),
         );
     }

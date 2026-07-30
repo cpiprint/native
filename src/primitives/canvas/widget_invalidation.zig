@@ -265,9 +265,12 @@ fn widgetChange(previous: WidgetLayoutNode, next: WidgetLayoutNode, previous_ind
         previous.depth != next.depth or
         previous.parent_index != next.parent_index or
         !rectsEqual(previous.frame, next.frame) or
+        previous.widget.code_line_number_digits != next.widget.code_line_number_digits or
         !widgetLayoutStylesEqual(previous.widget.layout, next.widget.layout);
     const content_dirty = !std.mem.eql(u8, previous.widget.text, next.widget.text) or
         !textSpansEqual(previous.widget.spans, next.widget.spans) or
+        previous.widget.static_text_group_id != next.widget.static_text_group_id or
+        previous.widget.static_text_group_offset != next.widget.static_text_group_offset or
         !chartDataEqual(previous.widget.chart, next.widget.chart) or
         !std.mem.eql(u8, previous.widget.placeholder, next.widget.placeholder) or
         !std.mem.eql(u8, previous.widget.icon, next.widget.icon) or

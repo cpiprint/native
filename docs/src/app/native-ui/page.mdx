@@ -104,7 +104,7 @@ Color and radius attributes reference design tokens by name — literals only, v
 </row>
 ```
 
-The color attributes are `background`, `foreground`, `accent`, `accent-foreground`, `border-color`, and `focus-ring`; values are `ColorTokens` field names: `background`, `surface`, `surface_subtle`, `surface_pressed`, `text`, `text_muted`, `border`, `accent`, `accent_text`, `destructive`, `destructive_text`, `success`, `success_text`, `warning`, `warning_text`, `info`, `info_text`, `focus_ring`, `shadow`, `disabled`. `info` is the violet identity hue beside the status trio — merged PR badges, "new" chips, informational callouts. `radius` takes a `RadiusTokens` name: `sm`, `md`, `lg`, `xl`.
+The color attributes are `background`, `foreground`, `accent`, `accent-foreground`, `border-color`, and `focus-ring`; values are `ColorTokens` field names: `background`, `surface`, `surface_subtle`, `surface_pressed`, `text`, `text_muted`, `syntax_plain`, `syntax_comment`, `syntax_keyword`, `syntax_literal`, `syntax_function`, `syntax_property`, `syntax_constant`, `border`, `accent`, `accent_text`, `destructive`, `destructive_text`, `success`, `success_text`, `warning`, `warning_text`, `info`, `info_text`, `focus_ring`, `shadow`, `scrim`, `disabled`. The `syntax_*` roles are the Geist Code Block palette shared by both built-in packs; `ui.code` and Markdown fences use them automatically. `info` is the violet identity hue beside the status trio — merged PR badges, "new" chips, informational callouts. `radius` takes a `RadiusTokens` name: `sm`, `md`, `lg`, `xl`.
 
 References resolve against the app's live tokens on every rebuild, so themed apps re-resolve them when the theme changes — dark mode flips `surface` for free. Anything dynamic beyond that (raw colors, per-state styling) stays in Zig via `ElementOptions.style`, which always wins over a token reference.
 
@@ -559,6 +559,23 @@ ui.paragraph(.{ .on_link = Ui.linkMsg(.open_url) }, &spans)
 
 Wrapping and measurement are span-aware (the platform text provider measures every run with the font it draws with), stacked paragraphs reserve their real wrapped height, and link spans are first-class: they carry `role=link` semantics in automation snapshots, show the pointing-hand cursor (the only place the engine uses it — controls keep the platform arrow, following native convention rather than the web's), and clicking one dispatches your `Msg` with the link payload.
 
+Source presentation is the reusable `ui.code` / `<code>` component. It wraps by default; `wrap="false"` preserves logical lines inside one horizontal scroll region, and `line-numbers` opts into a muted logical-line gutter. A definite `height` keeps overflow reachable with vertical scrolling (or both axes when wrapping is off):
+
+```html
+<code source="{component_source}" language="tsx" line-numbers wrap="false" width="480" label="Accordion example" />
+```
+
+```zig
+ui.code(.{
+    .language = .html,
+    .line_numbers = true,
+    .wrap = false,
+    .width = 480,
+}, model.component_source)
+```
+
+Recognized languages receive theme-aware syntax color for keywords, types/numbers, strings, and comments: Zig; JavaScript/TypeScript; JSX/TSX; JSON; shell; Python; Rust; C, C++, C#, Java, Kotlin, and Swift; Go; HTML/XML/SVG; CSS/SCSS/Less; and SQL. HTML-family highlighting distinguishes element and component tags, attributes, strings, comments, and JavaScript/TypeScript expressions. Unknown or omitted tags stay plain monospace, and the bounded highlighting fallback never drops code. See [Code](/components/code).
+
 Markdown builds on the same model. `native_sdk.markdown` maps a GitHub-flavored subset — headings, inline styles, links (including bare `http(s)://` URLs, which autolink with trailing punctuation trimmed), bullet/ordered/task lists, fenced code blocks, blockquotes, rules, pipe tables, and `<details>` collapsibles — onto ordinary widgets:
 
 ```zig
@@ -572,6 +589,8 @@ Md.view(ui, issue.body, .{
 ```
 
 Malformed input degrades to plain text — the build fn never fails. Task-list checkboxes render as disabled (display-only) checkboxes, and `<details>` expansion is state the caller's model owns.
+
+Fenced code preserves every source indentation level and lowers through the same `ui.code` component, including JSX/TSX-aware HTML-family highlighting. Markdown keeps the component defaults: wrapping on, line numbers off.
 
 GFM pipe tables map onto the real `table`/`table-row`/`table-cell` widgets: the header row renders bold, the delimiter row's `:---`/`:--:`/`---:` cells set per-column start/center/end alignment, every cell runs the full inline grammar (code, bold, links — links in cells are clickable), `\|` puts a literal pipe in a cell, and cells wrap at their column width (columns share the width equally in v1). A pipe block whose delimiter row is missing or mismatched is not a table and renders as plain paragraphs.
 
