@@ -47,6 +47,20 @@ export function readI64(bytes: Uint8Array, at: number): number {
   return value;
 }
 
+/// An i64 payload saturated into the f64-exact window: values at or
+/// past ±2^53 clamp to ±(2^53 − 1). Selection offsets ride this reader
+/// because the host's select-all synthesizes the maxInt "to the end"
+/// sentinel, which every consumer snaps to the text's length.
+export function readI64Saturating(bytes: Uint8Array, at: number): number {
+  const lo = readU32(bytes, at);
+  const hi = readU32(bytes, at + 4);
+  const hiSigned = hi >= 2147483648 ? hi - 4294967296 : hi;
+  const value = hiSigned * 4294967296 + lo;
+  if (value > 9007199254740991) return 9007199254740991;
+  if (value < -9007199254740991) return -9007199254740991;
+  return value;
+}
+
 export function readBool(bytes: Uint8Array, at: number): boolean {
   if (at >= bytes.length) {
     trap("a dispatch payload ended mid-value — the host and this core disagree about a type's layout");
@@ -206,14 +220,18 @@ export function decodeTextInputEvent(bytes: Uint8Array): TextInputEvent {
       return { kind: "move_caret", move: { direction: caretDirections[member]!, extend: extend } };
     }
     case 7: {
-      // f64-classed like every corpus contract's numeric slot: the
-      // integer classes wait on prove-or-refuse discharge through the
-      // whole write graph (see the corpus profiles' empty
-      // integer_slots), and every corpus value is exact in f64.
-      const anchor = readF64(bytes, 1);
-      const focus = readF64(bytes, 9);
+      // Selection indices are i64-classed slots and ride the i64
+      // encoding (saturating: select-all sends the maxInt "to the end"
+      // sentinel): bind the decoded values, range-guard them (an
+      // ordered comparison excludes NaN), and state wholeness with
+      // Math.trunc at the write.
+      const anchor = readI64Saturating(bytes, 1);
+      const focus = readI64Saturating(bytes, 9);
       assertConsumed(bytes, 17);
-      return { kind: "set_selection", selection: { anchor: anchor, focus: focus } };
+      if (anchor >= -9007199254740991 && anchor <= 9007199254740991 && focus >= -9007199254740991 && focus <= 9007199254740991) {
+        return { kind: "set_selection", selection: { anchor: Math.trunc(anchor), focus: Math.trunc(focus) } };
+      }
+      trap("a selection index is NaN or past ±(2^53 − 1) — the i64 slot has no honest value for it");
     }
     case 8: {
       const len = readU32(bytes, 1);
@@ -222,14 +240,15 @@ export function decodeTextInputEvent(bytes: Uint8Array): TextInputEvent {
       const present = readBool(bytes, at);
       at = at + 1;
       if (present) {
-        // The cursor rides f64: an optional's INNER integer class sits
-        // outside the profile's integer_slots vocabulary today, so the
-        // emitted contract classes this slot optional-f64 and the
-        // mirror encodes it that way (the value is a whole byte offset
-        // either way).
-        const cursor = readF64(bytes, at);
+        // The cursor is an i64-classed optional slot: range-guard the
+        // decoded value (an ordered comparison excludes NaN) and state
+        // wholeness with Math.trunc at the write.
+        const cursor = readI64(bytes, at);
         assertConsumed(bytes, at + 8);
-        return { kind: "set_composition", text: text, cursor: cursor };
+        if (cursor >= -9007199254740991 && cursor <= 9007199254740991) {
+          return { kind: "set_composition", text: text, cursor: Math.trunc(cursor) };
+        }
+        trap("a composition cursor is NaN or past ±(2^53 − 1) — an i64 slot has no honest value for it");
       }
       assertConsumed(bytes, at);
       return { kind: "set_composition", text: text, cursor: null };

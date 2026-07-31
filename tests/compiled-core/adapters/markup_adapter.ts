@@ -36,6 +36,7 @@ import {
   wBool,
   wBytes,
   wF64,
+  wI64,
   wU32,
   type Sink,
 } from "./wire.ts";
@@ -151,12 +152,24 @@ export function dispatch_bytes(tag: number, payload: Uint8Array): Uint8Array {
 }
 
 export function dispatch_number(tag: number, value: number): Uint8Array {
-  if (tag === TAG_toggle) return commit(coreUpdate(committed, { kind: "toggle", id: value }));
+  // These arms remain f64-classed in the contract: preserve the value
+  // exactly instead of routing it through the integer proof below.
   if (tag === TAG_pick) return commit(coreUpdate(committed, { kind: "pick", id: value }));
   if (tag === TAG_stamped) return commit(coreUpdate(committed, { kind: "stamped", at: value }));
   if (tag === TAG_hover_row) return commit(coreUpdate(committed, { kind: "hover_row", id: value }));
   if (tag === TAG_hover_off) return commit(coreUpdate(committed, { kind: "hover_off", id: value }));
-  if (tag === TAG_canvas_resized) return commit(coreUpdate(committed, { kind: "canvas_resized", width: value }));
+
+  // Integer-classed arms (ids and widths) prove in place: range-guard
+  // the raw f64 (an ordered comparison excludes NaN) and state
+  // wholeness with Math.trunc at the write.
+  if (tag === TAG_toggle || tag === TAG_canvas_resized) {
+    if (value >= -9007199254740991 && value <= 9007199254740991) {
+      const whole = Math.trunc(value);
+      if (tag === TAG_toggle) return commit(coreUpdate(committed, { kind: "toggle", taskId: whole }));
+      return commit(coreUpdate(committed, { kind: "canvas_resized", width: whole }));
+    }
+    trap("a numeric dispatch value is NaN or past ±(2^53 − 1) — an i64 slot has no honest value for it");
+  }
   trapUnknownTag("number", tag);
 }
 
@@ -273,6 +286,12 @@ function f64Payload(value: number): Uint8Array {
   return finish(sink);
 }
 
+function i64Payload(value: number): Uint8Array {
+  const sink = newSink();
+  wI64(sink, value);
+  return finish(sink);
+}
+
 function asciiString(bytes: Uint8Array): string {
   let out = "";
   for (let i = 0; i < bytes.length; i++) out = out + String.fromCharCode(bytes[i]!);
@@ -287,9 +306,10 @@ export function abi_frame_msg(width: number, height: number, timestampMs: number
     intervalMs: intervalMs,
   });
   if (produced === null) return noChannelMsg();
-  // The one arm this channel produces carries the frame width.
+  // The one arm this channel produces carries the frame width — an
+  // i64-classed slot, so the payload rides the i64 encoding.
   if (produced.kind === "canvas_resized") {
-    return channelEnvelope(TAG_canvas_resized, f64Payload(produced.width));
+    return channelEnvelope(TAG_canvas_resized, i64Payload(produced.width));
   }
   trap("the frame channel produced the unroutable arm " + produced.kind + " — the author module and this adapter disagree");
 }
@@ -388,26 +408,26 @@ export function model_snapshot(): Uint8Array {
   const sink = newSink();
   const model = committed;
   wEnum(sink, filters, model.filter);
-  wF64(sink, model.nextId);
-  wF64(sink, model.doneCount);
+  wI64(sink, model.nextId);
+  wI64(sink, model.doneCount);
   wBytes(sink, model.banner);
   wOptionalF64(sink, model.selected);
   wU32(sink, model.tasks.length);
   for (let i = 0; i < model.tasks.length; i++) {
     const task = model.tasks[i]!;
-    wF64(sink, task.id);
+    wI64(sink, task.id);
     wBytes(sink, task.title);
     wBool(sink, task.done);
   }
   wF64(sink, model.stampMs);
   wBytes(sink, model.draft);
-  wF64(sink, model.canvasWidth);
+  wI64(sink, model.canvasWidth);
   wF64(sink, model.zoom);
   wF64(sink, model.zoomWindowId);
   wBool(sink, model.zoomFromBoard);
   wBool(sink, model.dark);
   wF64(sink, model.chromeTop);
-  wF64(sink, model.previewSurface);
+  wI64(sink, model.previewSurface);
   wF64(sink, model.hoveredId);
   return finish(sink);
 }

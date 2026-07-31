@@ -51,10 +51,10 @@ import {
   readF64,
   subBytes,
   trap,
-  truncTowardZero,
   wBool,
   wBytes,
   wF64,
+  wI64,
   wU32,
   type Sink,
 } from "./wire.ts";
@@ -168,11 +168,18 @@ export function sortDirectionLabel(model: Model): Uint8Array {
 export function visibleRows(model: Model): TableRow[] {
   return h_visibleRows(model) as TableRow[];
 }
+// Classed helper returns prove at this boundary: bind the helper's
+// value, range-guard it (an ordered comparison excludes NaN), and state
+// wholeness with Math.trunc at the return.
 export function matchCount(model: Model): number {
-  return h_matchCount(model);
+  const count = h_matchCount(model);
+  if (count >= -9007199254740991 && count <= 9007199254740991) return Math.trunc(count);
+  trap("a helper return is NaN or past ±(2^53 − 1) — the i64 slot has no honest value for it");
 }
 export function shownCount(model: Model): number {
-  return h_shownCount(model);
+  const count = h_shownCount(model);
+  if (count >= -9007199254740991 && count <= 9007199254740991) return Math.trunc(count);
+  trap("a helper return is NaN or past ±(2^53 − 1) — the i64 slot has no honest value for it");
 }
 export function emptyTitle(model: Model): Uint8Array {
   return h_emptyTitle(model);
@@ -313,30 +320,48 @@ export function dispatch_bytes(tag: number, payload: Uint8Array): Uint8Array {
 }
 
 export function dispatch_number(tag: number, value: number): Uint8Array {
+  // Timer ticks remain f64-classed in the contract: preserve the value
+  // exactly instead of routing it through the integer proof below.
   if (tag === TAG_tick) return commit(coreUpdate(committed, { kind: "tick", at: value }));
-  if (tag === TAG_stamped) return commit(coreUpdate(committed, { kind: "stamped", at: value }));
-  if (tag === TAG_request_kill) return commit(coreUpdate(committed, { kind: "request_kill", pid: truncTowardZero(value) }));
-  if (tag === TAG_copy_name) return commit(coreUpdate(committed, { kind: "copy_name", pid: truncTowardZero(value) }));
+
+  // Integer-classed arms (the stamped timestamp and pids) prove in place:
+  // range-guard the raw f64 (an ordered comparison excludes NaN) and
+  // state wholeness with Math.trunc at the write.
+  if (tag === TAG_stamped || tag === TAG_request_kill || tag === TAG_copy_name) {
+    if (value >= -9007199254740991 && value <= 9007199254740991) {
+      const whole = Math.trunc(value);
+      if (tag === TAG_stamped) return commit(coreUpdate(committed, { kind: "stamped", stampedAt: whole }));
+      if (tag === TAG_request_kill) return commit(coreUpdate(committed, { kind: "request_kill", requestKillPid: whole }));
+      return commit(coreUpdate(committed, { kind: "copy_name", copyNamePid: whole }));
+    }
+    trap("a numeric dispatch value is NaN or past ±(2^53 − 1) — an i64 slot has no honest value for it");
+  }
   trapUnknownTag("number", tag);
 }
 
 export function dispatch_number_bytes(tag: number, value: number, payload: Uint8Array): Uint8Array {
-  if (tag === TAG_info_done) {
-    return commit(coreUpdate(committed, { kind: "info_done", code: truncTowardZero(value), output: payload }));
+  // Exit codes are i64-classed: the same guard-and-trunc proof as
+  // dispatch_number.
+  if (value >= -9007199254740991 && value <= 9007199254740991) {
+    const code = Math.trunc(value);
+    if (tag === TAG_info_done) {
+      return commit(coreUpdate(committed, { kind: "info_done", code: code, output: payload }));
+    }
+    if (tag === TAG_info2_done) {
+      return commit(coreUpdate(committed, { kind: "info2_done", info2Code: code, output: payload }));
+    }
+    if (tag === TAG_ps_done) {
+      return commit(coreUpdate(committed, { kind: "ps_done", psCode: code, output: payload }));
+    }
+    if (tag === TAG_mem_done) {
+      return commit(coreUpdate(committed, { kind: "mem_done", memCode: code, output: payload }));
+    }
+    if (tag === TAG_kill_done) {
+      return commit(coreUpdate(committed, { kind: "kill_done", killCode: code, output: payload }));
+    }
+    trapUnknownTag("number-with-bytes", tag);
   }
-  if (tag === TAG_info2_done) {
-    return commit(coreUpdate(committed, { kind: "info2_done", code: truncTowardZero(value), output: payload }));
-  }
-  if (tag === TAG_ps_done) {
-    return commit(coreUpdate(committed, { kind: "ps_done", code: truncTowardZero(value), output: payload }));
-  }
-  if (tag === TAG_mem_done) {
-    return commit(coreUpdate(committed, { kind: "mem_done", code: truncTowardZero(value), output: payload }));
-  }
-  if (tag === TAG_kill_done) {
-    return commit(coreUpdate(committed, { kind: "kill_done", code: truncTowardZero(value), output: payload }));
-  }
-  trapUnknownTag("number-with-bytes", tag);
+  trap("a numeric dispatch value is NaN or past ±(2^53 − 1) — an i64 slot has no honest value for it");
 }
 
 export function dispatch_bool(tag: number, value: number): Uint8Array {
@@ -466,35 +491,35 @@ export function model_snapshot(): Uint8Array {
   wEnum(sink, samplerPhases, model.phase);
   wEnum(sink, memCommands, model.memCommand);
   wBool(sink, model.paused);
-  wF64(sink, model.ticksSkipped);
+  wI64(sink, model.ticksSkipped);
   wBool(sink, model.psInflight);
   wBool(sink, model.memInflight);
-  wF64(sink, model.samplesTaken);
-  wF64(sink, model.sampledAtDayMs);
-  wF64(sink, model.cores);
-  wF64(sink, model.memTotalBytes);
-  wF64(sink, model.cpuPercentTenths);
-  wF64(sink, model.memUsedBytes);
-  wF64(sink, model.processCount);
-  wF64(sink, model.uptimeSeconds);
+  wI64(sink, model.samplesTaken);
+  wI64(sink, model.sampledAtDayMs);
+  wI64(sink, model.cores);
+  wI64(sink, model.memTotalBytes);
+  wI64(sink, model.cpuPercentTenths);
+  wI64(sink, model.memUsedBytes);
+  wI64(sink, model.processCount);
+  wI64(sink, model.uptimeSeconds);
   wU32(sink, model.rows.length);
   for (let i = 0; i < model.rows.length; i++) {
     const row = model.rows[i]!;
-    wF64(sink, row.pid);
-    wF64(sink, row.cpuTenths);
-    wF64(sink, row.memTenths);
-    wF64(sink, row.rssKb);
+    wI64(sink, row.pid);
+    wI64(sink, row.cpuTenths);
+    wI64(sink, row.memTenths);
+    wI64(sink, row.rssKb);
     wBytes(sink, row.name);
   }
-  wF64(sink, model.parseFailures);
+  wI64(sink, model.parseFailures);
   wNumbers(sink, model.cpuHistory as number[]);
   wNumbers(sink, model.memHistory as number[]);
   wNumbers(sink, model.procHistory as number[]);
   wBytes(sink, model.search.bytes);
-  wF64(sink, model.search.anchor);
-  wF64(sink, model.search.focus);
-  wF64(sink, model.search.compStart);
-  wF64(sink, model.search.compEnd);
+  wI64(sink, model.search.anchor);
+  wI64(sink, model.search.focus);
+  wI64(sink, model.search.compStart);
+  wI64(sink, model.search.compEnd);
   wEnum(sink, sortKeys, model.sortKey);
   wBool(sink, model.sortDescending);
   const pending = model.pendingKill;
@@ -502,14 +527,14 @@ export function model_snapshot(): Uint8Array {
     wBool(sink, false);
   } else {
     wBool(sink, true);
-    wF64(sink, pending.pid);
+    wI64(sink, pending.pid);
     wBytes(sink, pending.name);
   }
   wF64(sink, model.tableScroll);
   wBytes(sink, model.note);
   wBool(sink, model.noteClearsOnSample);
-  wF64(sink, model.sampleGeneration);
-  wF64(sink, model.noteStampGeneration);
+  wI64(sink, model.sampleGeneration);
+  wI64(sink, model.noteStampGeneration);
   wF64(sink, model.chromeLeading);
   wF64(sink, model.headerHeight);
   return finish(sink);
@@ -531,9 +556,9 @@ function bytesResult(value: Uint8Array): Uint8Array {
   return finish(sink);
 }
 
-function numberResult(value: number): Uint8Array {
+function intResult(value: number): Uint8Array {
   const sink = newSink();
-  wF64(sink, value);
+  wI64(sink, value);
   return finish(sink);
 }
 
@@ -548,7 +573,7 @@ function tableRowsResult(rows: TableRow[]): Uint8Array {
   wU32(sink, rows.length);
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]!;
-    wF64(sink, row.pid);
+    wI64(sink, row.pid);
     wBytes(sink, row.pidText);
     wBytes(sink, row.name);
     wBytes(sink, row.cpuText);
@@ -576,8 +601,8 @@ export function helper_call(helper: number, args: Uint8Array): Uint8Array {
   if (helper === 13) return bytesResult(h_sortDirectionIcon(committed));
   if (helper === 14) return bytesResult(h_sortDirectionLabel(committed));
   if (helper === 15) return tableRowsResult(h_visibleRows(committed) as TableRow[]);
-  if (helper === 16) return numberResult(h_matchCount(committed));
-  if (helper === 17) return numberResult(h_shownCount(committed));
+  if (helper === 16) return intResult(matchCount(committed));
+  if (helper === 17) return intResult(shownCount(committed));
   if (helper === 18) return bytesResult(h_emptyTitle(committed));
   if (helper === 19) return bytesResult(h_emptyHint(committed));
   if (helper === 20) return bytesResult(h_statusLine(committed));

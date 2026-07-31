@@ -147,20 +147,28 @@ function searchApply(d: SearchDraft, event: TextInputEvent): SearchDraft {
     if (clamped === null) return d;
     const nextClamped = applyTextInputEvent(state, clamped, MAX_SEARCH);
     if (nextClamped === null) return d;
+    // Composition bounds land in i64-classed slots: bind them, guard
+    // the range (an ordered comparison excludes NaN), and state
+    // wholeness with Math.trunc at the write; -1 stays the
+    // no-composition sentinel.
+    const clampedStart = nextClamped.composition !== null ? nextClamped.composition.start : -1;
+    const clampedEnd = nextClamped.composition !== null ? nextClamped.composition.end : -1;
     return {
       bytes: nextClamped.text,
       anchor: nextClamped.selection.anchor,
       focus: nextClamped.selection.focus,
-      compStart: nextClamped.composition !== null ? nextClamped.composition.start : -1,
-      compEnd: nextClamped.composition !== null ? nextClamped.composition.end : -1,
+      compStart: clampedStart >= -1 && clampedStart <= 9007199254740991 ? Math.trunc(clampedStart) : -1,
+      compEnd: clampedEnd >= -1 && clampedEnd <= 9007199254740991 ? Math.trunc(clampedEnd) : -1,
     };
   }
+  const nextStart = next.composition !== null ? next.composition.start : -1;
+  const nextEnd = next.composition !== null ? next.composition.end : -1;
   return {
     bytes: next.text,
     anchor: next.selection.anchor,
     focus: next.selection.focus,
-    compStart: next.composition !== null ? next.composition.start : -1,
-    compEnd: next.composition !== null ? next.composition.end : -1,
+    compStart: nextStart >= -1 && nextStart <= 9007199254740991 ? Math.trunc(nextStart) : -1,
+    compEnd: nextEnd >= -1 && nextEnd <= 9007199254740991 ? Math.trunc(nextEnd) : -1,
   };
 }
 
@@ -266,17 +274,20 @@ export function initialModel(): Model {
 export type Msg =
   | { readonly kind: "show_albums" }
   | { readonly kind: "show_songs" }
-  | { readonly kind: "open_album"; readonly id: number }
+  // Distinct source field names keep these i64 proof obligations from
+  // collapsing into QueueEntry.id or one another. Each wire payload
+  // remains the arm's single scalar.
+  | { readonly kind: "open_album"; readonly openAlbumId: number }
   | { readonly kind: "close_album" }
-  | { readonly kind: "play_album"; readonly id: number }
+  | { readonly kind: "play_album"; readonly playAlbumId: number }
   /// The play gesture on a track row: a different track starts fresh, the
   /// loaded one toggles play/pause in place.
-  | { readonly kind: "play_track"; readonly id: number }
+  | { readonly kind: "play_track"; readonly playTrackId: number }
   | { readonly kind: "toggle_play" }
   | { readonly kind: "next_track" }
   | { readonly kind: "prev_track" }
-  | { readonly kind: "queue_track"; readonly id: number }
-  | { readonly kind: "copy_title"; readonly id: number }
+  | { readonly kind: "queue_track"; readonly queueTrackId: number }
+  | { readonly kind: "copy_title"; readonly copyTitleId: number }
   | { readonly kind: "search_edit"; readonly edit: TextInputEvent }
   /// Every audio playback report: the load acknowledgment, position
   /// ticks, the one completion, failures, spectrum frames.
@@ -400,14 +411,20 @@ export function visibleAlbums(model: Model): readonly AlbumCell[] {
   const out: AlbumCell[] = [];
   for (const album of ALBUMS) {
     if (!albumMatches(query, album)) continue;
-    out.push({
-      id: album.id,
-      title: album.title,
-      artist: album.artist,
-      initials: album.initials,
-      cover: album.id,
-      playing: albumIsPlaying(model, album.id),
-    });
+    // Ids land in i64-classed slots: bind, range-guard (an ordered
+    // comparison excludes NaN), and state wholeness with Math.trunc at
+    // the write.
+    const albumId = album.id;
+    if (albumId >= 0 && albumId <= 9007199254740991) {
+      out.push({
+        id: Math.trunc(albumId),
+        title: album.title,
+        artist: album.artist,
+        initials: album.initials,
+        cover: Math.trunc(albumId),
+        playing: albumIsPlaying(model, album.id),
+      });
+    }
   }
   return out;
 }
@@ -682,18 +699,23 @@ export function update(model: Model, msg: Msg): [Model, Cmd<Msg>] {
       return [{ ...model, tab: "songs", libraryScrollTop: 0 }, Cmd.none];
     case "open_album": {
       // Resolve the payload id against the table and store the TABLE's
-      // id: markup payloads arrive as wire f64s, and keeping every id in
-      // the model integer-classed starts here.
-      const album = ALBUMS.find((a) => a.id === msg.id);
+      // id: the compiled adapter proves this arm's i64 class before the
+      // update, and resolving against the table keeps model ids classed.
+      const album = ALBUMS.find((a) => a.id === msg.openAlbumId);
       if (album === undefined) return [model, Cmd.none];
       // Every page change resets the controlled scroll: the offset is
-      // model state, so the fresh page opens at its top.
-      return [{ ...model, openAlbum: album.id, tab: "albums", libraryScrollTop: 0 }, Cmd.none];
+      // model state, so the fresh page opens at its top. The id lands in
+      // an i64-classed slot: bind, range-guard, Math.trunc at the write.
+      const albumId = album.id;
+      if (albumId >= 0 && albumId <= 9007199254740991) {
+        return [{ ...model, openAlbum: Math.trunc(albumId), tab: "albums", libraryScrollTop: 0 }, Cmd.none];
+      }
+      return [model, Cmd.none];
     }
     case "close_album":
       return [{ ...model, openAlbum: null, libraryScrollTop: 0 }, Cmd.none];
     case "play_album": {
-      const album = ALBUMS.find((a) => a.id === msg.id);
+      const album = ALBUMS.find((a) => a.id === msg.playAlbumId);
       if (album === undefined) return [model, Cmd.none];
       const albumId = album.id;
       const first = TRACKS.find((t) => t.album === albumId && t.number === 1);
@@ -710,11 +732,11 @@ export function update(model: Model, msg: Msg): [Model, Cmd<Msg>] {
     case "play_track": {
       // The loaded track toggles play/pause in place; a different track
       // starts fresh.
-      if (model.now === msg.id) {
+      if (model.now === msg.playTrackId) {
         if (model.playing) return [{ ...model, playing: false }, Cmd.audioPause("player")];
         return [{ ...model, playing: true }, Cmd.audioResume("player")];
       }
-      const track = TRACKS.find((t) => t.id === msg.id);
+      const track = TRACKS.find((t) => t.id === msg.playTrackId);
       if (track === undefined) return [model, Cmd.none];
       return [
         startedModel(model, track.id, track.durationMs),
@@ -775,19 +797,25 @@ export function update(model: Model, msg: Msg): [Model, Cmd<Msg>] {
       ];
     }
     case "queue_track": {
-      const track = TRACKS.find((t) => t.id === msg.id);
+      const track = TRACKS.find((t) => t.id === msg.queueTrackId);
       if (track === undefined) return [model, Cmd.none];
       if (model.queue.some((q) => q.id === track.id)) return [model, Cmd.none];
       if (model.queue.length >= MAX_QUEUE) {
-        return [{ ...model, queueDropped: model.queueDropped + 1 }, Cmd.none];
+        return [{ ...model, queueDropped: model.queueDropped < 9007199254740991 ? model.queueDropped + 1 : 9007199254740991 }, Cmd.none];
       }
-      return [{ ...model, queue: [...model.queue, { id: track.id }] }, Cmd.none];
+      // The id lands in an i64-classed slot: bind, range-guard,
+      // Math.trunc at the write.
+      const trackId = track.id;
+      if (trackId >= 0 && trackId <= 9007199254740991) {
+        return [{ ...model, queue: [...model.queue, { id: Math.trunc(trackId) }] }, Cmd.none];
+      }
+      return [model, Cmd.none];
     }
     case "copy_title": {
-      const track = TRACKS.find((t) => t.id === msg.id);
+      const track = TRACKS.find((t) => t.id === msg.copyTitleId);
       if (track === undefined) return [model, Cmd.none];
       return [
-        { ...model, copiesRequested: model.copiesRequested + 1 },
+        { ...model, copiesRequested: model.copiesRequested < 9007199254740991 ? model.copiesRequested + 1 : 9007199254740991 },
         Cmd.clipboardWrite(track.title),
       ];
     }
@@ -797,10 +825,14 @@ export function update(model: Model, msg: Msg): [Model, Cmd<Msg>] {
       switch (msg.state) {
         case "loaded": {
           const next = adoptPlatformDuration(model, msg.durationMs);
+          // The position lands in an i64-classed slot: bind, range-guard
+          // (an ordered comparison excludes NaN), and state wholeness
+          // with Math.trunc at the write.
+          const loadedPos = msg.positionMs;
           return [{
             ...next,
             loadPending: false,
-            elapsedMs: msg.positionMs,
+            elapsedMs: loadedPos >= 0 && loadedPos <= 9007199254740991 ? Math.trunc(loadedPos) : 0,
             playing: msg.playing,
             buffering: msg.buffering,
           }, Cmd.none];
@@ -810,20 +842,24 @@ export function update(model: Model, msg: Msg): [Model, Cmd<Msg>] {
           // land before the new track's `loaded` — drop it by the guard.
           if (model.loadPending || model.now === null) return [model, Cmd.none];
           const next = adoptPlatformDuration(model, msg.durationMs);
+          // The tick lands in an i64-classed slot: bind, range-guard,
+          // Math.trunc at the write.
+          const rawPos = msg.positionMs;
+          const tick = rawPos >= 0 && rawPos <= 9007199254740991 ? Math.trunc(rawPos) : 0;
           // The coarse tick corrects the rendered clock. In motion,
           // forward corrections apply and small backward ones hold flat
           // (the bar never visibly rewinds); a past-slack disagreement
           // snaps. With no motion the tick is simply the truth.
           if (next.playing && !msg.buffering) {
             if (
-              msg.positionMs > next.elapsedMs ||
-              next.elapsedMs - msg.positionMs > POSITION_SNAP_SLACK_MS
+              tick > next.elapsedMs ||
+              next.elapsedMs - tick > POSITION_SNAP_SLACK_MS
             ) {
-              return [{ ...next, elapsedMs: msg.positionMs, buffering: msg.buffering }, Cmd.none];
+              return [{ ...next, elapsedMs: tick, buffering: msg.buffering }, Cmd.none];
             }
             return [{ ...next, buffering: msg.buffering }, Cmd.none];
           }
-          return [{ ...next, elapsedMs: msg.positionMs, buffering: msg.buffering }, Cmd.none];
+          return [{ ...next, elapsedMs: tick, buffering: msg.buffering }, Cmd.none];
         }
         // Band-magnitude analysis frames are consciously ignored — the
         // soundboard's identity is the clean catalog (parity with the
@@ -890,7 +926,11 @@ export function update(model: Model, msg: Msg): [Model, Cmd<Msg>] {
         rest -= 1000;
         thousandth += 1;
       }
-      const target = thousandth * permille;
+      // The product lands in an i64-classed slot: bind, range-guard (an
+      // ordered comparison excludes NaN), and state wholeness with
+      // Math.trunc at the write.
+      const scaled = thousandth * permille;
+      const target = scaled >= 0 && scaled <= 9007199254740991 ? Math.trunc(scaled) : 0;
       // The rendered clock jumps to the scrub target directly (a seek is
       // the one sanctioned rewind) and the engine seeks the real player.
       return [{ ...model, elapsedMs: target }, Cmd.audioSeek("player", target)];
@@ -923,9 +963,12 @@ export function update(model: Model, msg: Msg): [Model, Cmd<Msg>] {
       // cadence, so each tick steps exactly one interval — a burst of
       // queued fires is bounded by construction — and the position
       // events correct any drift. The clock never passes the total.
+      // The advance saturates at the i64 class's provable ceiling, and
+      // the cap comparison replaces Math.min so the proof stays in view.
       const advanced = model.elapsedMs + CLOCK_TICK_MS;
-      const cap = model.nowDurationMs > 0 ? model.nowDurationMs : advanced;
-      return [{ ...model, elapsedMs: Math.min(advanced, cap) }, Cmd.none];
+      const stepped = advanced >= 0 ? (advanced <= 9007199254740991 ? Math.trunc(advanced) : 9007199254740991) : 0;
+      const cap = model.nowDurationMs > 0 ? model.nowDurationMs : stepped;
+      return [{ ...model, elapsedMs: stepped <= cap ? stepped : cap }, Cmd.none];
     }
   }
 }

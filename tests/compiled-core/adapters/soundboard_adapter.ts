@@ -64,12 +64,14 @@ import {
   readBool,
   readBytesBody,
   readF64,
+  readI64,
   readU32,
   subBytes,
   trap,
   wBool,
   wBytes,
   wF64,
+  wI64,
   wU32,
   type Sink,
 } from "./wire.ts";
@@ -140,11 +142,18 @@ export function searchText(model: Model): Uint8Array {
 export function visibleAlbums(model: Model): AlbumCell[] {
   return h_visibleAlbums(model) as AlbumCell[];
 }
+// Classed helper returns prove at this boundary: bind the helper's
+// value, range-guard it (an ordered comparison excludes NaN), and state
+// wholeness with Math.trunc at the return.
 export function gridColumns(model: Model): number {
-  return h_gridColumns(model);
+  const count = h_gridColumns(model);
+  if (count >= -9007199254740991 && count <= 9007199254740991) return Math.trunc(count);
+  trap("a helper return is NaN or past ±(2^53 − 1) — the i64 slot has no honest value for it");
 }
 export function gridShownColumns(model: Model): number {
-  return h_gridShownColumns(model);
+  const count = h_gridShownColumns(model);
+  if (count >= -9007199254740991 && count <= 9007199254740991) return Math.trunc(count);
+  trap("a helper return is NaN or past ±(2^53 − 1) — the i64 slot has no honest value for it");
 }
 export function gridTileWidth(model: Model): number {
   return h_gridTileWidth(model);
@@ -165,16 +174,24 @@ export function openAlbumRows(model: Model): TrackRow[] {
   return h_openAlbumRows(model) as TrackRow[];
 }
 export function visibleAlbumCount(model: Model): number {
-  return h_visibleAlbumCount(model);
+  const count = h_visibleAlbumCount(model);
+  if (count >= -9007199254740991 && count <= 9007199254740991) return Math.trunc(count);
+  trap("a helper return is NaN or past ±(2^53 − 1) — the i64 slot has no honest value for it");
 }
 export function albumCount(model: Model): number {
-  return h_albumCount(model);
+  const count = h_albumCount(model);
+  if (count >= -9007199254740991 && count <= 9007199254740991) return Math.trunc(count);
+  trap("a helper return is NaN or past ±(2^53 − 1) — the i64 slot has no honest value for it");
 }
 export function visibleTrackCount(model: Model): number {
-  return h_visibleTrackCount(model);
+  const count = h_visibleTrackCount(model);
+  if (count >= -9007199254740991 && count <= 9007199254740991) return Math.trunc(count);
+  trap("a helper return is NaN or past ±(2^53 − 1) — the i64 slot has no honest value for it");
 }
 export function trackCount(model: Model): number {
-  return h_trackCount(model);
+  const count = h_trackCount(model);
+  if (count >= -9007199254740991 && count <= 9007199254740991) return Math.trunc(count);
+  trap("a helper return is NaN or past ±(2^53 − 1) — the i64 slot has no honest value for it");
 }
 export function noAlbumMatches(model: Model): boolean {
   return h_noAlbumMatches(model);
@@ -186,7 +203,9 @@ export function noMatchesLabel(model: Model): Uint8Array {
   return h_noMatchesLabel(model);
 }
 export function openAlbumId(model: Model): number {
-  return h_openAlbumId(model);
+  const id = h_openAlbumId(model);
+  if (id >= -9007199254740991 && id <= 9007199254740991) return Math.trunc(id);
+  trap("a helper return is NaN or past ±(2^53 − 1) — the i64 slot has no honest value for it");
 }
 export function openAlbumTitle(model: Model): Uint8Array {
   return h_openAlbumTitle(model);
@@ -195,7 +214,9 @@ export function openAlbumInitials(model: Model): Uint8Array {
   return h_openAlbumInitials(model);
 }
 export function openAlbumCover(model: Model): number {
-  return h_openAlbumCover(model);
+  const cover = h_openAlbumCover(model);
+  if (cover >= -9007199254740991 && cover <= 9007199254740991) return Math.trunc(cover);
+  trap("a helper return is NaN or past ±(2^53 − 1) — the i64 slot has no honest value for it");
 }
 export function openAlbumMeta(model: Model): Uint8Array {
   return h_openAlbumMeta(model);
@@ -213,7 +234,9 @@ export function nowPlayingInitials(model: Model): Uint8Array {
   return h_nowPlayingInitials(model);
 }
 export function nowPlayingCover(model: Model): number {
-  return h_nowPlayingCover(model);
+  const cover = h_nowPlayingCover(model);
+  if (cover >= -9007199254740991 && cover <= 9007199254740991) return Math.trunc(cover);
+  trap("a helper return is NaN or past ±(2^53 − 1) — the i64 slot has no honest value for it");
 }
 export function playPauseIcon(model: Model): Uint8Array {
   return h_playPauseIcon(model);
@@ -228,7 +251,9 @@ export function durationLabel(model: Model): Uint8Array {
   return h_durationLabel(model);
 }
 export function queueLen(model: Model): number {
-  return h_queueLen(model);
+  const len = h_queueLen(model);
+  if (len >= -9007199254740991 && len <= 9007199254740991) return Math.trunc(len);
+  trap("a helper return is NaN or past ±(2^53 − 1) — the i64 slot has no honest value for it");
 }
 
 // The designated shape-flag exports: init returns the bare model
@@ -335,14 +360,26 @@ export function dispatch_bytes(tag: number, payload: Uint8Array): Uint8Array {
 }
 
 export function dispatch_number(tag: number, value: number): Uint8Array {
-  if (tag === TAG_open_album) return commit(coreUpdate(committed, { kind: "open_album", id: value }));
-  if (tag === TAG_play_album) return commit(coreUpdate(committed, { kind: "play_album", id: value }));
-  if (tag === TAG_play_track) return commit(coreUpdate(committed, { kind: "play_track", id: value }));
-  if (tag === TAG_queue_track) return commit(coreUpdate(committed, { kind: "queue_track", id: value }));
-  if (tag === TAG_copy_title) return commit(coreUpdate(committed, { kind: "copy_title", id: value }));
+  // These arms remain f64-classed in the contract: preserve the value
+  // exactly instead of routing it through the integer proof below.
   if (tag === TAG_clock_tick) return commit(coreUpdate(committed, { kind: "clock_tick", at: value }));
   if (tag === TAG_scrubbed) return commit(coreUpdate(committed, { kind: "scrubbed", fraction: value }));
   if (tag === TAG_canvas_resized) return commit(coreUpdate(committed, { kind: "canvas_resized", width: value }));
+
+  // The id arms are i64-classed and prove in place: range-guard the raw
+  // f64 (an ordered comparison excludes NaN) and state wholeness with
+  // Math.trunc at the write.
+  if (tag === TAG_open_album || tag === TAG_play_album || tag === TAG_play_track || tag === TAG_queue_track || tag === TAG_copy_title) {
+    if (value >= -9007199254740991 && value <= 9007199254740991) {
+      const whole = Math.trunc(value);
+      if (tag === TAG_open_album) return commit(coreUpdate(committed, { kind: "open_album", openAlbumId: whole }));
+      if (tag === TAG_play_album) return commit(coreUpdate(committed, { kind: "play_album", playAlbumId: whole }));
+      if (tag === TAG_play_track) return commit(coreUpdate(committed, { kind: "play_track", playTrackId: whole }));
+      if (tag === TAG_queue_track) return commit(coreUpdate(committed, { kind: "queue_track", queueTrackId: whole }));
+      return commit(coreUpdate(committed, { kind: "copy_title", copyTitleId: whole }));
+    }
+    trap("a numeric dispatch value is NaN or past ±(2^53 − 1) — an i64 slot has no honest value for it");
+  }
   trapUnknownTag("number", tag);
 }
 
@@ -382,15 +419,23 @@ export function dispatch_record(tag: number, fields: Uint8Array): Uint8Array {
     }
     const bandsLen = readU32(fields, 22);
     assertConsumed(fields, 26 + bandsLen);
-    return commit(coreUpdate(committed, {
-      kind: "audio_event",
-      state: audioStates[state]! as "loaded",
-      positionMs: readF64(fields, 4),
-      durationMs: readF64(fields, 12),
-      playing: readBool(fields, 20),
-      buffering: readBool(fields, 21),
-      bands: readBytesBody(fields, 26, bandsLen),
-    }));
+    // The clock slots are i64-classed: range-guard each decoded value (an
+    // ordered comparison excludes NaN) and state wholeness with Math.trunc
+    // at the write.
+    const positionMs = readI64(fields, 4);
+    const durationMs = readI64(fields, 12);
+    if (positionMs >= -9007199254740991 && positionMs <= 9007199254740991 && durationMs >= -9007199254740991 && durationMs <= 9007199254740991) {
+      return commit(coreUpdate(committed, {
+        kind: "audio_event",
+        state: audioStates[state]! as "loaded",
+        positionMs: Math.trunc(positionMs),
+        durationMs: Math.trunc(durationMs),
+        playing: readBool(fields, 20),
+        buffering: readBool(fields, 21),
+        bands: readBytesBody(fields, 26, bandsLen),
+      }));
+    }
+    trap("an audio clock value is NaN or past ±(2^53 − 1) — an i64 slot has no honest value for it");
   }
   if (tag === TAG_library_scrolled) {
     assertConsumed(fields, 64);
@@ -542,15 +587,6 @@ function wEnum(sink: Sink, members: string[], value: string): void {
   trap("a model enum slot carries an undeclared member — the author module and this adapter disagree");
 }
 
-function wOptionalF64(sink: Sink, value: number | null): void {
-  if (value === null) {
-    wBool(sink, false);
-    return;
-  }
-  wBool(sink, true);
-  wF64(sink, value);
-}
-
 function wOptionalBytes(sink: Sink, value: Uint8Array | null): void {
   if (value === null) {
     wBool(sink, false);
@@ -560,31 +596,40 @@ function wOptionalBytes(sink: Sink, value: Uint8Array | null): void {
   wBytes(sink, value);
 }
 
+function wOptionalI64(sink: Sink, value: number | null): void {
+  if (value === null) {
+    wBool(sink, false);
+    return;
+  }
+  wBool(sink, true);
+  wI64(sink, value);
+}
+
 export function model_snapshot(): Uint8Array {
   const sink = newSink();
   const model = committed;
   wEnum(sink, tabs, model.tab);
-  wOptionalF64(sink, model.openAlbum);
-  wOptionalF64(sink, model.now);
+  wOptionalI64(sink, model.openAlbum);
+  wOptionalI64(sink, model.now);
   wBool(sink, model.playing);
-  wF64(sink, model.elapsedMs);
-  wF64(sink, model.nowDurationMs);
-  wF64(sink, model.platformDurationMs);
+  wI64(sink, model.elapsedMs);
+  wI64(sink, model.nowDurationMs);
+  wI64(sink, model.platformDurationMs);
   wBool(sink, model.loadPending);
   wBool(sink, model.buffering);
   wBool(sink, model.assetsMissing);
   wBool(sink, model.streamFailed);
   wU32(sink, model.queue.length);
   for (let i = 0; i < model.queue.length; i++) {
-    wF64(sink, model.queue[i]!.id);
+    wI64(sink, model.queue[i]!.id);
   }
-  wF64(sink, model.queueDropped);
+  wI64(sink, model.queueDropped);
   wBytes(sink, model.search.bytes);
-  wF64(sink, model.search.anchor);
-  wF64(sink, model.search.focus);
-  wF64(sink, model.search.compStart);
-  wF64(sink, model.search.compEnd);
-  wF64(sink, model.copiesRequested);
+  wI64(sink, model.search.anchor);
+  wI64(sink, model.search.focus);
+  wI64(sink, model.search.compStart);
+  wI64(sink, model.search.compEnd);
+  wI64(sink, model.copiesRequested);
   wF64(sink, model.libraryScrollTop);
   wF64(sink, model.canvasWidth);
   wOptionalBytes(sink, model.urlBase);
@@ -616,16 +661,22 @@ function numberResult(value: number): Uint8Array {
   return finish(sink);
 }
 
+function intResult(value: number): Uint8Array {
+  const sink = newSink();
+  wI64(sink, value);
+  return finish(sink);
+}
+
 function albumCellsResult(rows: AlbumCell[]): Uint8Array {
   const sink = newSink();
   wU32(sink, rows.length);
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]!;
-    wF64(sink, row.id);
+    wI64(sink, row.id);
     wBytes(sink, row.title);
     wBytes(sink, row.artist);
     wBytes(sink, row.initials);
-    wF64(sink, row.cover);
+    wI64(sink, row.cover);
     wBool(sink, row.playing);
   }
   return finish(sink);
@@ -636,8 +687,8 @@ function trackRowsResult(rows: TrackRow[]): Uint8Array {
   wU32(sink, rows.length);
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]!;
-    wF64(sink, row.id);
-    wF64(sink, row.number);
+    wI64(sink, row.id);
+    wI64(sink, row.number);
     wBytes(sink, row.title);
     wBytes(sink, row.subtitle);
     wBytes(sink, row.duration);
@@ -656,35 +707,35 @@ export function helper_call(helper: number, args: Uint8Array): Uint8Array {
   if (helper === 2) return boolResult(h_detailPage(committed));
   if (helper === 3) return bytesResult(h_searchText(committed));
   if (helper === 4) return albumCellsResult(h_visibleAlbums(committed) as AlbumCell[]);
-  if (helper === 5) return numberResult(h_gridColumns(committed));
-  if (helper === 6) return numberResult(h_gridShownColumns(committed));
+  if (helper === 5) return intResult(gridColumns(committed));
+  if (helper === 6) return intResult(gridShownColumns(committed));
   if (helper === 7) return numberResult(h_gridTileWidth(committed));
   if (helper === 8) return numberResult(h_gridRowWidth(committed));
   if (helper === 9) return numberResult(h_gridCoverSize(committed));
   if (helper === 10) return numberResult(h_gridTileHeight(committed));
   if (helper === 11) return trackRowsResult(h_visibleTracks(committed) as TrackRow[]);
   if (helper === 12) return trackRowsResult(h_openAlbumRows(committed) as TrackRow[]);
-  if (helper === 13) return numberResult(h_visibleAlbumCount(committed));
-  if (helper === 14) return numberResult(h_albumCount(committed));
-  if (helper === 15) return numberResult(h_visibleTrackCount(committed));
-  if (helper === 16) return numberResult(h_trackCount(committed));
+  if (helper === 13) return intResult(visibleAlbumCount(committed));
+  if (helper === 14) return intResult(albumCount(committed));
+  if (helper === 15) return intResult(visibleTrackCount(committed));
+  if (helper === 16) return intResult(trackCount(committed));
   if (helper === 17) return boolResult(h_noAlbumMatches(committed));
   if (helper === 18) return boolResult(h_noTrackMatches(committed));
   if (helper === 19) return bytesResult(h_noMatchesLabel(committed));
-  if (helper === 20) return numberResult(h_openAlbumId(committed));
+  if (helper === 20) return intResult(openAlbumId(committed));
   if (helper === 21) return bytesResult(h_openAlbumTitle(committed));
   if (helper === 22) return bytesResult(h_openAlbumInitials(committed));
-  if (helper === 23) return numberResult(h_openAlbumCover(committed));
+  if (helper === 23) return intResult(openAlbumCover(committed));
   if (helper === 24) return bytesResult(h_openAlbumMeta(committed));
   if (helper === 25) return boolResult(h_idle(committed));
   if (helper === 26) return bytesResult(h_nowPlayingTitle(committed));
   if (helper === 27) return bytesResult(h_nowPlayingArtist(committed));
   if (helper === 28) return bytesResult(h_nowPlayingInitials(committed));
-  if (helper === 29) return numberResult(h_nowPlayingCover(committed));
+  if (helper === 29) return intResult(nowPlayingCover(committed));
   if (helper === 30) return bytesResult(h_playPauseIcon(committed));
   if (helper === 31) return numberResult(h_progressFraction(committed));
   if (helper === 32) return bytesResult(h_elapsedLabel(committed));
   if (helper === 33) return bytesResult(h_durationLabel(committed));
-  if (helper === 34) return numberResult(h_queueLen(committed));
+  if (helper === 34) return intResult(queueLen(committed));
   trap("helper index " + helper + " does not name an exported model helper of this core — the host and this core disagree about the contract");
 }
