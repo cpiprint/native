@@ -517,13 +517,15 @@ pub fn build(b: *std.Build) void {
             test_step.dependOn(&battery_run.step);
         }
         // The corpus contract artifacts an external core toolchain
-        // consumes: per fixture, the extracted contract sidecar and its
-        // TypeScript facade projection under zig-out/core-contracts.
-        const contracts_step = b.step("stage-core-contracts", "Install each ts-core fixture's contract sidecar and TypeScript facade projection under zig-out/core-contracts (requires node)");
+        // consumes: per fixture, the extracted contract sidecar, the
+        // generated entry module, and the compiler profile that builds
+        // it, under zig-out/core-contracts.
+        const contracts_step = b.step("stage-core-contracts", "Install each ts-core fixture's contract sidecar, generated entry module, and compiler profile under zig-out/core-contracts (requires node)");
         for (ts_core_artifacts.core_contracts) |contract| {
             const dir: std.Build.InstallDir = .{ .custom = b.fmt("core-contracts/{s}", .{contract.name}) };
             contracts_step.dependOn(&b.addInstallFileWithDir(contract.sidecar, dir, "core.contract.json").step);
             contracts_step.dependOn(&b.addInstallFileWithDir(contract.facade, dir, "core_facade.ts").step);
+            contracts_step.dependOn(&b.addInstallFileWithDir(contract.profile, dir, "core_profile.json").step);
         }
         ts_core_e2e_step.dependOn(&host_e2e_run.step);
         ts_core_e2e_step.dependOn(&soundboard_e2e_run.step);
@@ -2970,8 +2972,8 @@ const TsCoreE2eArtifacts = struct {
     /// — every battery skipped — otherwise.
     compiled_core_parity: []const CompiledCoreParity,
     /// Per-fixture contract artifacts for an external core toolchain:
-    /// the extracted contract sidecar and its TypeScript facade
-    /// projection, installed by the stage-core-contracts step.
+    /// the effective contract sidecar and its TypeScript facade/profile
+    /// projections, installed by the stage-core-contracts step.
     core_contracts: []const CoreContract,
 };
 
@@ -2984,6 +2986,7 @@ const CoreContract = struct {
     name: []const u8,
     sidecar: std.Build.LazyPath,
     facade: std.Build.LazyPath,
+    profile: std.Build.LazyPath,
 };
 
 /// One fixture's compiled-core supply: the archive link input(s) and
@@ -3114,52 +3117,55 @@ fn tsCoreE2eArtifact(
 
     const conformance_mod = module(b, target, optimize, "tests/sidecar/conformance_tests.zig");
     conformance_mod.addImport("native_sdk", desktop_mod);
-    // The canonical value encoder the facade parity axis compares
+    // The canonical value encoder the envelope and snapshot axes compare
     // against (the same module the generated shims stage).
     conformance_mod.addImport("corewire_rt", module(b, target, optimize, "tools/corewire/shim_rt.zig"));
     conformance_mod.addImport("ts_markup_core", markup_fixture_mod);
     conformance_mod.addImport("shim_markup_core", sidecarShimModule(b, target, optimize, corewire_exe, b.path("tests/sidecar/markup_fixture.contract.json")));
-    conformance_mod.addImport("facade_markup_core", facadeCoreModule(b, target, optimize, node, corewire_exe, b.path("tests/sidecar/markup_fixture.contract.json")));
     // The integer-class fixture: a hand-written sidecar attesting mixed
     // i64/u64 slot classes, so the suite drives boundary and full-range
-    // integer values through a generated mirror's decode paths and
-    // holds the compiled facade's integer encoders to the same bytes.
+    // integer values through a generated mirror's decode paths.
     conformance_mod.addImport("shim_integer_core", sidecarShimModule(b, target, optimize, corewire_exe, b.path("tests/sidecar/integer_fixture.contract.json")));
-    conformance_mod.addImport("facade_integer_core", facadeCoreModule(b, target, optimize, node, corewire_exe, b.path("tests/sidecar/integer_fixture.contract.json")));
     const conformance_fixtures = [_]struct {
         ts_import: []const u8,
         shim_import: []const u8,
-        facade_import: []const u8,
         contract_name: []const u8,
         core_mod: *std.Build.Module,
         entry: []const u8,
+        /// Attested integer slots the compiled projection carries as f64
+        /// (values that reach the f64-exact boundary have no honest i64
+        /// declaration on that side).
+        f64_slots: []const []const u8 = &.{},
     }{
-        .{ .ts_import = "ts_host_core", .shim_import = "shim_host_core", .facade_import = "facade_host_core", .contract_name = "host-fixture", .core_mod = fixture_mod, .entry = "tests/ts-core/fixture.ts" },
-        .{ .ts_import = "ts_soundboard_core", .shim_import = "shim_soundboard_core", .facade_import = "facade_soundboard_core", .contract_name = "soundboard", .core_mod = soundboard_core_mod, .entry = "examples/soundboard-ts/src/core.ts" },
-        .{ .ts_import = "ts_monitor_core", .shim_import = "shim_monitor_core", .facade_import = "facade_monitor_core", .contract_name = "system-monitor", .core_mod = monitor_core_mod, .entry = "examples/system-monitor-ts/src/core.ts" },
-        .{ .ts_import = "ts_ai_chat_core", .shim_import = "shim_ai_chat_core", .facade_import = "facade_ai_chat_core", .contract_name = "ai-chat", .core_mod = ai_chat_core_mod, .entry = "examples/ai-chat-ts/src/core.ts" },
+        .{ .ts_import = "ts_host_core", .shim_import = "shim_host_core", .contract_name = "host-fixture", .core_mod = fixture_mod, .entry = "tests/ts-core/fixture.ts", .f64_slots = &.{"Model.pastBytes"} },
+        .{ .ts_import = "ts_soundboard_core", .shim_import = "shim_soundboard_core", .contract_name = "soundboard", .core_mod = soundboard_core_mod, .entry = "examples/soundboard-ts/src/core.ts" },
+        .{ .ts_import = "ts_monitor_core", .shim_import = "shim_monitor_core", .contract_name = "system-monitor", .core_mod = monitor_core_mod, .entry = "examples/system-monitor-ts/src/core.ts" },
+        .{ .ts_import = "ts_ai_chat_core", .shim_import = "shim_ai_chat_core", .contract_name = "ai-chat", .core_mod = ai_chat_core_mod, .entry = "examples/ai-chat-ts/src/core.ts" },
     };
     // The corpus contract artifacts an external core toolchain consumes
-    // (stage-core-contracts): the extracted sidecar plus its facade
-    // projection, per fixture.
+    // (stage-core-contracts): the effective sidecar plus its generated
+    // entry module and compiler profile, per fixture.
     var core_contracts: std.ArrayList(CoreContract) = .empty;
     {
         const markup_sidecar = sidecarExtractJson(b, target, optimize, extract_mod, markup_fixture_mod, "tests/ts-core/markup_fixture.ts");
+        const projections = facadeProjections(b, corewire_exe, markup_sidecar, &.{});
         core_contracts.append(b.allocator, .{
             .name = "markup-fixture",
-            .sidecar = markup_sidecar,
-            .facade = facadeTsFile(b, corewire_exe, markup_sidecar),
+            .sidecar = projections.sidecar,
+            .facade = projections.facade,
+            .profile = projections.profile,
         }) catch @panic("OOM");
     }
     for (conformance_fixtures) |fixture| {
         const sidecar_json = sidecarExtractJson(b, target, optimize, extract_mod, fixture.core_mod, fixture.entry);
         conformance_mod.addImport(fixture.ts_import, fixture.core_mod);
         conformance_mod.addImport(fixture.shim_import, sidecarShimModule(b, target, optimize, corewire_exe, sidecar_json));
-        conformance_mod.addImport(fixture.facade_import, facadeCoreModule(b, target, optimize, node, corewire_exe, sidecar_json));
+        const projections = facadeProjections(b, corewire_exe, sidecar_json, fixture.f64_slots);
         core_contracts.append(b.allocator, .{
             .name = fixture.contract_name,
-            .sidecar = sidecar_json,
-            .facade = facadeTsFile(b, corewire_exe, sidecar_json),
+            .sidecar = projections.sidecar,
+            .facade = projections.facade,
+            .profile = projections.profile,
         }) catch @panic("OOM");
     }
 
@@ -3192,17 +3198,12 @@ fn tsCoreE2eArtifact(
         while (inputs.next()) |input| {
             parity_mod.addObjectFile(.{ .cwd_relative = b.dupe(input) });
         }
-        const parity_tests = filteredTestArtifact(b, parity_mod, "external-core-parity-tests", &.{});
-        // Run the checker over the supplied sidecar explicitly (the
-        // shim generation above validates too, but the checker tier —
-        // both projections, integer_slots structural rules included —
-        // is the surface an external compile is verified against).
-        const check_sidecar = b.addRunArtifact(corewire_exe);
-        check_sidecar.addArg("--sidecar");
-        check_sidecar.addFileArg(parity_sidecar);
-        check_sidecar.addArg("--check");
-        parity_tests.step.dependOn(&check_sidecar.step);
-        break :blk parity_tests;
+        // The generated mirror is the only projection this lane uses;
+        // sidecarShimModule validates exactly that surface. Do not run
+        // the all-projections checker here: an external compiler's
+        // sidecar may legitimately predate facade-only metadata while
+        // remaining a valid mirror contract for its linked archive.
+        break :blk filteredTestArtifact(b, parity_mod, "external-core-parity-tests", &.{});
     } else null;
 
     // The full-corpus compiled-core batteries: each supplied fixture's
@@ -3247,14 +3248,6 @@ fn tsCoreE2eArtifact(
         battery_mod.addImport(entry.core_import, paired_mod);
         if (entry.second_import) |second| battery_mod.addImport(second, entry.second_mod.?);
         const battery = filteredTestArtifact(b, battery_mod, b.fmt("compiled-core-{s}-tests", .{entry.name}), &.{});
-        // Run the checker tier over the supplied sidecar explicitly —
-        // the same surface an external compile is verified against in
-        // the markup parity suite.
-        const check_sidecar = b.addRunArtifact(corewire_exe);
-        check_sidecar.addArg("--sidecar");
-        check_sidecar.addFileArg(supply.sidecar);
-        check_sidecar.addArg("--check");
-        battery.step.dependOn(&check_sidecar.step);
         compiled_core_parity.append(b.allocator, .{ .name = b.dupe(entry.name), .tests = battery }) catch @panic("OOM");
     }
 
@@ -3331,18 +3324,36 @@ fn pairedCoreModule(
     return mod;
 }
 
-/// A sidecar's TypeScript facade projection alone (core_facade.ts) —
-/// the contract module an external core toolchain compiles.
-fn facadeTsFile(
+const FacadeProjections = struct {
+    sidecar: std.Build.LazyPath,
+    facade: std.Build.LazyPath,
+    profile: std.Build.LazyPath,
+};
+
+/// A sidecar's compiled-core projections: the effective contract after
+/// caller-stated demotions, the generated entry module (core_facade.ts), and
+/// the compiler profile that builds it (core_profile.json), emitted by one
+/// corewire invocation so no staged sibling can describe a different layout.
+fn facadeProjections(
     b: *std.Build,
     corewire_exe: *std.Build.Step.Compile,
     sidecar_json: std.Build.LazyPath,
-) std.Build.LazyPath {
+    f64_slots: []const []const u8,
+) FacadeProjections {
     const generate = b.addRunArtifact(corewire_exe);
     generate.addArg("--sidecar");
     generate.addFileArg(sidecar_json);
     generate.addArg("--facade");
-    return generate.addOutputFileArg("core_facade.ts");
+    const facade = generate.addOutputFileArg("core_facade.ts");
+    generate.addArg("--profile");
+    const profile = generate.addOutputFileArg("core_profile.json");
+    generate.addArg("--effective-sidecar");
+    const sidecar = generate.addOutputFileArg("core.contract.json");
+    for (f64_slots) |slot| {
+        generate.addArg("--f64-slot");
+        generate.addArg(slot);
+    }
+    return .{ .sidecar = sidecar, .facade = facade, .profile = profile };
 }
 
 /// One fixture's generated-mirror module: run corewire over the
@@ -3367,50 +3378,6 @@ fn sidecarShimModule(
     _ = staged.addCopyFile(b.path("tools/corewire/core_abi.zig"), "core_abi.zig");
     return b.createModule(.{
         .root_source_file = shim_root,
-        .target = target,
-        .optimize = optimize,
-    });
-}
-
-/// One fixture's compiled-facade module: run corewire over the sidecar
-/// for its TypeScript projection (core_facade.ts), then compile that
-/// projection through the shipped transpiler — the checker/emitter tier
-/// is the compile, so this step IS the subset-acceptance proof — and
-/// stage the emitted Zig beside its rt kernel like any fixture core.
-fn facadeCoreModule(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    node: []const u8,
-    corewire_exe: *std.Build.Step.Compile,
-    sidecar_json: std.Build.LazyPath,
-) *std.Build.Module {
-    const generate = b.addRunArtifact(corewire_exe);
-    generate.addArg("--sidecar");
-    generate.addFileArg(sidecar_json);
-    generate.addArg("--facade");
-    const facade_ts = generate.addOutputFileArg("core_facade.ts");
-    const staged_ts = b.addWriteFiles();
-    const facade_entry = staged_ts.addCopyFile(facade_ts, "core.ts");
-
-    const transpile = b.addSystemCommand(&.{node});
-    transpile.addFileArg(b.path("packages/core/src/cli.ts"));
-    transpile.addFileArg(facade_entry);
-    transpile.addArg("-o");
-    const emitted_core = transpile.addOutputFileArg("core.zig");
-    tsCoreAddDirInputs(b, transpile, "packages/core/sdk");
-    const transpiler_sources = [_][]const u8{
-        "checker.ts", "cli.ts", "diagnostics.ts", "emitter.ts", "infer.ts", "modules.ts", "transpile.ts", "typed_ast.ts", "types.ts",
-    };
-    for (transpiler_sources) |source| {
-        transpile.addFileInput(b.path(b.fmt("packages/core/src/{s}", .{source})));
-    }
-
-    const staged = b.addWriteFiles();
-    const core_root = staged.addCopyFile(emitted_core, "core.zig");
-    _ = staged.addCopyFile(b.path("packages/core/rt/rt.zig"), "rt.zig");
-    return b.createModule(.{
-        .root_source_file = core_root,
         .target = target,
         .optimize = optimize,
     });

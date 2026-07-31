@@ -269,7 +269,7 @@ const emittedFixtureNames = [
   "jsPow", "tagEq", "tagIsNull",
   "tagCast", "strEq", "strIsNull", "numEq", "numIsNull", "empty_bytes", "UpdateResult", "InitResult",
   "CommitMode", "commitBytes", "commitScalars", "commitModelRoot",
-  "shouldCopy", "inOldHeap", "old_heap_base", "old_heap_len", "core_root",
+  "shouldCopy", "inOldHeap", "old_heap_base", "old_heap_len", "core_root", "type_origins",
 ] as const;
 
 /// The `Cmd.audio*` control verbs and their zig enum literals (`resume` is a
@@ -375,6 +375,7 @@ export class Emitter {
     this.fileSet = new Set(this.files);
     this.sourceName = sourceName;
     this.capacities = capacities;
+    this.validateGeneratedMetadataNames();
     this.claimModuleNames();
     this.computeExceptions();
   }
@@ -518,6 +519,43 @@ export class Emitter {
     };
     visit(root);
     return found;
+  }
+
+  /// Layer-3 re-derivation of the fixed names the contract extractor reads.
+  /// The checker gives the normal teaching; this fence prevents a direct
+  /// emitter caller from producing duplicate Zig declarations.
+  private validateGeneratedMetadataNames(): void {
+    const refuseTypeOrigins = (name: ts.Identifier): void => {
+      if (name.text === "type_origins") {
+        this.fail(name, "`type_origins` collides with the generated contract type-origin metadata declaration; rename the authored declaration.", "NS1038");
+      }
+    };
+    for (const file of this.files) {
+      for (const stmt of file.statements) {
+        if (
+          ts.isInterfaceDeclaration(stmt) ||
+          ts.isTypeAliasDeclaration(stmt) ||
+          ts.isClassDeclaration(stmt) ||
+          ts.isFunctionDeclaration(stmt)
+        ) {
+          if (stmt.name) refuseTypeOrigins(stmt.name);
+        } else if (ts.isVariableStatement(stmt)) {
+          for (const decl of stmt.declarationList.declarations) {
+            if (ts.isIdentifier(decl.name)) refuseTypeOrigins(decl.name);
+          }
+        }
+      }
+      for (const binding of exportListBindings(this.tast, file)) {
+        if (binding.exportedName === "type_origins") {
+          this.fail(binding.spec.name, "`type_origins` collides with the generated contract type-origin metadata declaration; rename the export.", "NS1038");
+        }
+      }
+    }
+    for (const union of this.table.unions.values()) {
+      if (union.arms.some((arm) => arm.fields.length === 1) && union.arms.some((arm) => arm.tag === "payload_members")) {
+        this.fail(union.decl.name, `Union \`${union.name}\` has an arm named \`payload_members\`, which collides with its generated single-payload metadata declaration; rename the arm.`, "NS1038");
+      }
+    }
   }
 
   /// Claim every module-level name up front, across all files: fixture
@@ -1014,8 +1052,66 @@ export class Emitter {
       this.emitHoistedFunctions();
     }
     this.emitInstantiatedTypes();
+    this.emitTypeOrigins();
     this.emitCommitWalkers();
     return this.out.join("\n") + "\n";
+  }
+
+  /// The declaring module of every named type the contract tables can
+  /// reach — a contract fact the sidecar extractor carries so a contract
+  /// consumer can re-export each type from its own module. SDK library
+  /// modules spell their shipped staging path (`sdk/<name>.ts`); the
+  /// core's own modules spell their path relative to the entry module's
+  /// directory, with POSIX separators because the sidecar/facade contract is
+  /// platform-independent. Synthesized (anonymous) type names stay out:
+  /// they are declared nowhere.
+  private emitTypeOrigins(): void {
+    const sdkDir = path.resolve(path.dirname(sdkCoreModulePath));
+    const entryDir = path.dirname(path.resolve(this.file.fileName));
+    const seen = new Set<string>();
+    const entries: string[] = [];
+    for (const file of this.files) {
+      for (const stmt of file.statements) {
+        if (!ts.isInterfaceDeclaration(stmt) && !ts.isTypeAliasDeclaration(stmt) && !ts.isClassDeclaration(stmt)) continue;
+        if (!stmt.name) continue;
+        const name = stmt.name.text;
+        if (seen.has(name)) continue;
+        if (!this.table.structs.has(name) && !this.table.enums.has(name) && !this.table.unions.has(name)) continue;
+        if (this.table.genericStructTemplates.has(name) || this.table.genericAliasTemplates.has(name)) continue;
+        seen.add(name);
+        const fileName = path.resolve(file.fileName);
+        const origin =
+          path.dirname(fileName) === sdkDir
+            ? `sdk/${path.basename(fileName)}`
+            : path.relative(entryDir, fileName).split(path.sep).join("/");
+        const exported =
+          hasExportModifier(stmt) ||
+          file.statements.some(
+            (candidate) =>
+              ts.isExportDeclaration(candidate) &&
+              candidate.moduleSpecifier === undefined &&
+              candidate.exportClause !== undefined &&
+              ts.isNamedExports(candidate.exportClause) &&
+              candidate.exportClause.elements.some(
+                (spec) => spec.name.text === name && this.tast.exportSpecifierTarget(spec) === stmt,
+              ),
+          );
+        // The third tuple field is additive and appears only for a private
+        // declaration. Older extractors keep reading the two origin fields;
+        // current ones use the marker to synthesize a structural facade type
+        // instead of importing a name its module does not export.
+        entries.push(`    .{ ${zigString(name)}, ${zigString(origin)}${exported ? "" : ", false"} },`);
+      }
+    }
+    if (entries.length === 0) return;
+    this.out.push(``);
+    this.out.push(`// The declaring module of every named contract-table type (the sidecar`);
+    this.out.push(`// extractor's origin facts; a third false field marks declarations the`);
+    this.out.push(`// authored module does not export. Synthesized names are declared nowhere`);
+    this.out.push(`// and stay out).`);
+    this.out.push(`pub const type_origins = .{`);
+    this.out.push(...entries);
+    this.out.push(`};`);
   }
 
   /// R15e: emit every queued generic instantiation under its resolved
@@ -1953,6 +2049,18 @@ export class Emitter {
           this.out.push(`    ${zigId(arm.tag)}: struct { ${fields.join(", ")} },`);
         }
       }
+      const singles = un.arms.filter((a) => a.fields.length === 1);
+      if (singles.length > 0) {
+        // The authored member name of each single-payload arm: the arm's
+        // emitted payload spells the bare type, erasing the author's
+        // spelling, so the sidecar extractor reads it from this table (a
+        // contract consumer constructing arm values needs the author's
+        // property names).
+        this.out.push(``);
+        this.out.push(
+          `    pub const payload_members = .{ ${singles.map((a) => `.${zigId(a.tag)} = ${zigString(a.fields[0].tsName)}`).join(", ")} };`,
+        );
+      }
       if (name === "Msg" && this.unbound.msg.length > 0) {
         // The dead-state lint opt-out `native check` reads (viewUnbound).
         this.out.push(``);
@@ -1985,6 +2093,7 @@ export class Emitter {
     const names = new Set<string>(emittedFixtureNames);
     names.add("Thrown");
     names.add("thrown_payload");
+    names.add("type_origins");
     names.add(THROWN_UNION_NAME);
     for (const file of this.files) {
       for (const stmt of file.statements) {
@@ -11609,6 +11718,21 @@ function isScalarElem(t: ZType): boolean {
 
 function zigId(name: string): string {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ? name : `@"${name}"`;
+}
+
+/// A Zig double-quoted string literal for an authored spelling (name
+/// tables the sidecar extractor reads).
+function zigString(text: string): string {
+  let out = '"';
+  for (const ch of text) {
+    if (ch === '"') out += '\\"';
+    else if (ch === "\\") out += "\\\\";
+    else if (ch === "\n") out += "\\n";
+    else if (ch === "\r") out += "\\r";
+    else if (ch === "\t") out += "\\t";
+    else out += ch;
+  }
+  return out + '"';
 }
 
 /// Zig keywords that are legal JS label identifiers — a TS label with one of

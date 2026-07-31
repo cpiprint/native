@@ -68,21 +68,38 @@ pub const Field = struct {
 
 pub const Struct = struct {
     name: []const u8,
+    /// The declaring module of the type, entry-relative (an additive
+    /// origin fact; null on sidecars that predate it and for
+    /// synthesized names, which are declared nowhere).
+    origin: ?[]const u8 = null,
+    /// Whether the declaring module exports this table designation under
+    /// its own name. Absent on older sidecars, where true preserves the
+    /// historical import/re-export behavior.
+    exported: bool = true,
     fields: []const Field,
 };
 
 pub const Enum = struct {
     name: []const u8,
+    origin: ?[]const u8 = null,
+    exported: bool = true,
     members: []const []const u8,
 };
 
 pub const UnionArm = struct {
     name: []const u8,
+    /// The authored member name of a single-payload arm (an additive
+    /// fact; the payload descriptor erases the author's spelling, and a
+    /// consumer constructing arm values needs it back). Null for bare
+    /// and multi-field arms, and on sidecars that predate the fact.
+    member: ?[]const u8 = null,
     payload: TypeRef,
 };
 
 pub const Union = struct {
     name: []const u8,
+    origin: ?[]const u8 = null,
+    exported: bool = true,
     arms: []const UnionArm,
 };
 
@@ -112,6 +129,9 @@ pub const Payload = union(enum) {
 
 pub const MsgArm = struct {
     name: []const u8,
+    /// The authored member name of a single-payload arm (see
+    /// UnionArm.member).
+    member: ?[]const u8 = null,
     payload: Payload,
 };
 
@@ -387,6 +407,20 @@ const Mapper = struct {
         return std.fmt.parseInt(u64, text, 16) catch unreachable;
     }
 
+    /// An OPTIONAL nonempty-string member: null when absent (additive
+    /// facts older emitters do not write), refused when present but not
+    /// a nonempty string.
+    fn optionalString(self: *Mapper, map: std.json.ObjectMap, name: []const u8, at: []const u8) error{ Refused, OutOfMemory }!?[]const u8 {
+        const value = map.get(name) orelse return null;
+        return try self.nonEmptyString(value, self.path("{s}.{s}", .{ at, name }));
+    }
+
+    /// An additive boolean member with its compatibility default.
+    fn optionalBoolean(self: *Mapper, map: std.json.ObjectMap, name: []const u8, at: []const u8, default: bool) error{ Refused, OutOfMemory }!bool {
+        const value = map.get(name) orelse return default;
+        return try self.boolean(value, self.path("{s}.{s}", .{ at, name }));
+    }
+
     fn stringList(self: *Mapper, value: std.json.Value, at: []const u8) error{ Refused, OutOfMemory }![]const []const u8 {
         const items = try self.array(value, at);
         const out = try self.arena.alloc([]const u8, items.items.len);
@@ -486,7 +520,12 @@ const Mapper = struct {
         const out = try self.arena.alloc(Struct, items.items.len);
         for (items.items, 0..) |item, index| {
             const at = self.path("types.structs[{d}]", .{index});
-            const entry = try self.members(item, at, &.{ "name", "fields" });
+            // "synthesized" is an additive marker some emitters place on
+            // records they named themselves. The current projection uses
+            // `origin` as the authoritative authored-vs-synthesized fact and
+            // retains the name-pattern fallback for old null-origin sidecars,
+            // so this older marker remains accepted and unused.
+            const entry = try self.members(item, at, &.{ "name", "origin", "exported", "synthesized", "fields" });
             entry.warnUnknown();
             const fields_value = try self.array(try entry.get("fields"), self.path("{s}.fields", .{at}));
             const fields = try self.arena.alloc(Field, fields_value.items.len);
@@ -501,6 +540,8 @@ const Mapper = struct {
             }
             out[index] = .{
                 .name = try self.nonEmptyString(try entry.get("name"), self.path("{s}.name", .{at})),
+                .origin = try self.optionalString(entry.map, "origin", at),
+                .exported = try self.optionalBoolean(entry.map, "exported", at, true),
                 .fields = fields,
             };
         }
@@ -512,10 +553,12 @@ const Mapper = struct {
         const out = try self.arena.alloc(Enum, items.items.len);
         for (items.items, 0..) |item, index| {
             const at = self.path("types.enums[{d}]", .{index});
-            const entry = try self.members(item, at, &.{ "name", "members" });
+            const entry = try self.members(item, at, &.{ "name", "origin", "exported", "members" });
             entry.warnUnknown();
             out[index] = .{
                 .name = try self.nonEmptyString(try entry.get("name"), self.path("{s}.name", .{at})),
+                .origin = try self.optionalString(entry.map, "origin", at),
+                .exported = try self.optionalBoolean(entry.map, "exported", at, true),
                 .members = try self.stringList(try entry.get("members"), self.path("{s}.members", .{at})),
             };
         }
@@ -527,21 +570,24 @@ const Mapper = struct {
         const out = try self.arena.alloc(Union, items.items.len);
         for (items.items, 0..) |item, index| {
             const at = self.path("types.unions[{d}]", .{index});
-            const entry = try self.members(item, at, &.{ "name", "arms" });
+            const entry = try self.members(item, at, &.{ "name", "origin", "exported", "arms" });
             entry.warnUnknown();
             const arms_value = try self.array(try entry.get("arms"), self.path("{s}.arms", .{at}));
             const arms = try self.arena.alloc(UnionArm, arms_value.items.len);
             for (arms_value.items, 0..) |arm_value, arm_index| {
                 const arm_at = self.path("{s}.arms[{d}]", .{ at, arm_index });
-                const arm = try self.members(arm_value, arm_at, &.{ "name", "payload" });
+                const arm = try self.members(arm_value, arm_at, &.{ "name", "member", "payload" });
                 arm.warnUnknown();
                 arms[arm_index] = .{
                     .name = try self.nonEmptyString(try arm.get("name"), self.path("{s}.name", .{arm_at})),
+                    .member = try self.optionalString(arm.map, "member", arm_at),
                     .payload = try self.mapTypeRef(try arm.get("payload"), self.path("{s}.payload", .{arm_at})),
                 };
             }
             out[index] = .{
                 .name = try self.nonEmptyString(try entry.get("name"), self.path("{s}.name", .{at})),
+                .origin = try self.optionalString(entry.map, "origin", at),
+                .exported = try self.optionalBoolean(entry.map, "exported", at, true),
                 .arms = arms,
             };
         }
@@ -663,10 +709,11 @@ const Mapper = struct {
         const arms = try self.arena.alloc(MsgArm, arms_value.items.len);
         for (arms_value.items, 0..) |arm_value, index| {
             const at = self.path("msg.arms[{d}]", .{index});
-            const arm = try self.members(arm_value, at, &.{ "name", "payload" });
+            const arm = try self.members(arm_value, at, &.{ "name", "member", "payload" });
             arm.warnUnknown();
             arms[index] = .{
                 .name = try self.nonEmptyString(try arm.get("name"), self.path("{s}.name", .{at})),
+                .member = try self.optionalString(arm.map, "member", at),
                 .payload = try self.mapPayload(try arm.get("payload"), self.path("{s}.payload", .{at})),
             };
         }
@@ -1685,6 +1732,64 @@ fn validateIntegerSlots(arena: std.mem.Allocator, sidecar: Sidecar, diags: *Diag
     }
 }
 
+/// Restate a validated sidecar after applying record-slot f64 demotions.
+/// Mutating the dynamic document instead of serializing the typed reader
+/// preserves unknown additive fields for newer producers. The caller first
+/// validates each path against the typed contract, so a miss here is internal
+/// projection drift rather than user input.
+pub fn projectF64SlotsJson(arena: std.mem.Allocator, source: []const u8, f64_slots: []const []const u8) ![]const u8 {
+    if (f64_slots.len == 0) return source;
+
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, arena, source, .{});
+    const types = root.object.getPtr("types").?;
+    const structs = types.object.getPtr("structs").?;
+    for (f64_slots) |slot_path| {
+        const dot = std.mem.indexOfScalar(u8, slot_path, '.') orelse return error.ProjectionDrift;
+        const container = slot_path[0..dot];
+        const field_name = slot_path[dot + 1 ..];
+        var changed = false;
+        for (structs.array.items) |*entry| {
+            if (!std.mem.eql(u8, entry.object.get("name").?.string, container)) continue;
+            const fields = entry.object.getPtr("fields").?;
+            for (fields.array.items) |*field| {
+                if (!std.mem.eql(u8, field.object.get("name").?.string, field_name)) continue;
+                const ref = field.object.getPtr("type").?;
+                const kind = ref.object.getPtr("kind").?;
+                if (std.mem.eql(u8, kind.string, "optional")) {
+                    const inner = ref.object.getPtr("inner").?;
+                    inner.object.getPtr("kind").?.* = .{ .string = "f64" };
+                } else {
+                    kind.* = .{ .string = "f64" };
+                }
+                changed = true;
+                break;
+            }
+            break;
+        }
+        if (!changed) return error.ProjectionDrift;
+    }
+
+    const attestations = root.object.getPtr("integer_slots").?;
+    var index: usize = 0;
+    while (index < attestations.array.items.len) {
+        const slot = attestations.array.items[index].object.get("slot").?.string;
+        const demoted = for (f64_slots) |candidate| {
+            if (std.mem.eql(u8, slot, candidate)) break true;
+        } else false;
+        if (demoted) {
+            _ = attestations.array.orderedRemove(index);
+        } else {
+            index += 1;
+        }
+    }
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{ .whitespace = .indent_2 } };
+    try json.write(root);
+    try out.writer.writeByte('\n');
+    return out.written();
+}
+
 // --------------------------------------------------------------- tests
 
 const testing = std.testing;
@@ -1749,6 +1854,18 @@ pub const minimal_valid_json =
     \\  "async_free": true
     \\}
 ;
+
+test "effective sidecar carries f64 demotions into its type table and attestations" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const projected = try projectF64SlotsJson(arena, minimal_valid_json, &.{"Model.count"});
+    var diags = Diagnostics{ .arena = arena };
+    const parsed = try read(arena, projected, &diags);
+    const model = findStruct(parsed.types, "Model").?;
+    try testing.expect(model.fields[0].type == .f64);
+    try testing.expectEqual(@as(usize, 0), parsed.integer_slots.len);
+}
 
 fn expectRefusal(source: []const u8, expected_path: []const u8, expected_fragment: []const u8) !void {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);

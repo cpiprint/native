@@ -3,7 +3,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildEmitter, emit, transpile } from "./helpers.ts";
+import { buildEmitter, emit, transpile, transpileFiles } from "./helpers.ts";
 import { ts } from "../src/typed_ast.ts";
 
 test("R1 exported const number folds to pub const i64", () => {
@@ -49,6 +49,42 @@ export function stamp(src: Uint8Array): Uint8Array {
 test("R3 Uint8Array alias becomes []const u8", () => {
   const zig = emit(`export type Bytes = Uint8Array;\nexport function id(b: Bytes): Bytes { return b; }`);
   assert.match(zig, /pub const Bytes = \[\]const u8;/);
+});
+
+test("contract type origins preserve entry-relative subdirectory paths", () => {
+  const result = transpileFiles({
+    "core.ts": `
+import { type View } from "./ui/views.ts";
+export interface Model { readonly view: View; }
+export type Msg = { readonly kind: "show"; readonly view: View };
+export function initialModel(): Model { return { view: { page: 0 } }; }
+export function update(model: Model, msg: Msg): Model {
+  switch (msg.kind) {
+    case "show": return { view: msg.view };
+  }
+}
+`,
+    "ui/views.ts": `export interface View { readonly page: number; }`,
+  });
+  assert.equal(result.ok, true, result.diagnostics.map((d) => d.message).join("\n"));
+  assert.ok(result.zig!.includes('.{ "View", "ui/views.ts" }'), result.zig!);
+  assert.ok(result.zig!.includes('.{ "Model", "core.ts" }'), result.zig!);
+});
+
+test("contract type origins mark private reachable declarations", () => {
+  const zig = emit(`
+interface Hidden { readonly value: number; }
+export interface Model { readonly hidden: Hidden; }
+export type Msg = { readonly kind: "replace"; readonly hidden: Hidden };
+export function initialModel(): Model { return { hidden: { value: 0 } }; }
+export function update(_model: Model, msg: Msg): Model {
+  switch (msg.kind) {
+    case "replace": return { hidden: msg.hidden };
+  }
+}
+`);
+  assert.match(zig, /\.\{ "Hidden", "[^"]+\.ts", false \}/);
+  assert.match(zig, /\.\{ "Model", "[^"]+\.ts" \}/);
 });
 
 test("R3b SDK asciiBytes intrinsic folds a literal to rodata (recognized by identity, renames honored)", () => {
@@ -2326,6 +2362,25 @@ export function auditCount(model: Model): number { return model.count; }
   assert.match(zig, /pub const Model = struct \{[\s\S]*?pub const view_unbound = \.\{ "nextId", "auditCount" \};[\s\S]*?\};/);
   assert.match(zig, /pub const Msg = union\(enum\) \{[\s\S]*?pub const view_unbound = \.\{ "chrome_changed" \};[\s\S]*?\};/);
   assert.ok(!zig.includes("viewUnbound"), "the config list itself never emits");
+});
+
+test("viewUnbound resolves field and helper homonyms before Msg kinds", () => {
+  const zig = emit(`
+export interface Model { readonly count: number; }
+export type Msg = { readonly kind: "count" } | { readonly kind: "probe" } | { readonly kind: "bump" };
+export const viewUnbound = ["count", "probe"] as const;
+export function initialModel(): Model { return { count: 0 }; }
+export function update(model: Model, msg: Msg): Model {
+  switch (msg.kind) {
+    case "count": return model;
+    case "probe": return model;
+    case "bump": return { count: model.count + 1 };
+  }
+}
+export function probe(model: Model): boolean { return model.count > 0; }
+`);
+  assert.match(zig, /pub const Model = struct \{[\s\S]*?pub const view_unbound = \.\{ "count", "probe" \};[\s\S]*?\};/);
+  assert.equal(zig.match(/pub const view_unbound/g)?.length, 1, "the homonymous Msg kinds remain bound");
 });
 
 test("R7B envMsgs emits the comptime tuple the wiring walks", () => {
