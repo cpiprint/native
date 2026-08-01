@@ -946,7 +946,29 @@ static const char *NativeSdkCefBridgeScript() {
     if ((windowFlags & (1u << 2)) != 0) window.ignoresMouseEvents = YES;
     if ((windowFlags & (1u << 3)) != 0) [self.passiveShowWindows addObject:key];
     [window setTitle:title.length > 0 ? title : @"native-sdk"];
-    if (!restoreFrame) [window center];
+    if (!restoreFrame) {
+        [window center];
+        // Match the system-WebView host and Win32's default placement:
+        // secondary windows should reveal the window that opened them,
+        // not land directly on top of it.
+        NSWindow *referenceWindow = NSApp.keyWindow ?: self.window;
+        if (!makeMain && referenceWindow) {
+            NSRect referenceFrame = referenceWindow.frame;
+            NSRect cascadedFrame = window.frame;
+            cascadedFrame.origin.x = NSMinX(referenceFrame) + 24.0;
+            cascadedFrame.origin.y = NSMaxY(referenceFrame) - 24.0 - NSHeight(cascadedFrame);
+
+            NSScreen *referenceScreen = referenceWindow.screen ?: window.screen ?: NSScreen.mainScreen;
+            if (referenceScreen) {
+                NSRect visibleFrame = referenceScreen.visibleFrame;
+                CGFloat maxOriginX = MAX(NSMinX(visibleFrame), NSMaxX(visibleFrame) - NSWidth(cascadedFrame));
+                CGFloat maxOriginY = MAX(NSMinY(visibleFrame), NSMaxY(visibleFrame) - NSHeight(cascadedFrame));
+                cascadedFrame.origin.x = MIN(MAX(NSMinX(cascadedFrame), NSMinX(visibleFrame)), maxOriginX);
+                cascadedFrame.origin.y = MIN(MAX(NSMinY(cascadedFrame), NSMinY(visibleFrame)), maxOriginY);
+            }
+            [window setFrame:cascadedFrame display:NO];
+        }
+    }
 
     NSView *stackRoot = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
     stackRoot.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
@@ -3128,7 +3150,7 @@ native_sdk_appkit_open_dialog_result_t native_sdk_appkit_show_open_dialog(native
             NSString *path = [[NSString alloc] initWithBytes:opts->default_path length:opts->default_path_len encoding:NSUTF8StringEncoding];
             panel.directoryURL = [NSURL fileURLWithPath:path];
         }
-        panel.canChooseFiles = YES;
+        panel.canChooseFiles = opts->allow_directories == 0;
         panel.canChooseDirectories = opts->allow_directories != 0;
         panel.allowsMultipleSelection = opts->allow_multiple != 0;
         NativeSdkConfigurePanelExtensions(panel, NativeSdkParseExtensions(opts->extensions, opts->extensions_len));

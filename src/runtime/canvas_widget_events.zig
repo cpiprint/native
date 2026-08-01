@@ -330,14 +330,27 @@ pub fn RuntimeCanvasWidgetEvents(comptime Runtime: type) type {
                         // menu path before reaching here).
                         self.views[index].canvas_widget_click_count = 0;
                         self.views[index].canvas_widget_click_timestamp_ns = 0;
+                        self.views[index].canvas_widget_click_pointer_id = 0;
+                        self.views[index].canvas_widget_click_target_id = 0;
                         return;
                     }
                     const previous_count = self.views[index].canvas_widget_click_count;
                     const previous_timestamp = self.views[index].canvas_widget_click_timestamp_ns;
                     const previous_point = self.views[index].canvas_widget_click_point;
+                    const previous_pointer_id = self.views[index].canvas_widget_click_pointer_id;
+                    const previous_target_id = self.views[index].canvas_widget_click_target_id;
                     const point = pointer_event.pointer.point;
+                    const pointer_id = pointer_event.pointer.pointer_id;
+                    const target_id: canvas.ObjectId = if (pointer_event.press_target) |target|
+                        target.id
+                    else if (pointer_event.target) |target|
+                        target.id
+                    else
+                        0;
                     const chained = previous_count != 0 and
                         previous_timestamp != 0 and
+                        pointer_id == previous_pointer_id and
+                        target_id == previous_target_id and
                         input_event.timestamp_ns >= previous_timestamp and
                         input_event.timestamp_ns - previous_timestamp <= canvas_widget_multi_click_interval_ns and
                         @abs(point.x - previous_point.x) <= canvas_widget_multi_click_slop and
@@ -348,6 +361,8 @@ pub fn RuntimeCanvasWidgetEvents(comptime Runtime: type) type {
                     self.views[index].canvas_widget_click_count = count;
                     self.views[index].canvas_widget_click_timestamp_ns = input_event.timestamp_ns;
                     self.views[index].canvas_widget_click_point = point;
+                    self.views[index].canvas_widget_click_pointer_id = pointer_id;
+                    self.views[index].canvas_widget_click_target_id = target_id;
                     pointer_event.pointer.click_count = count;
                 },
                 .move, .up => {
@@ -2070,6 +2085,12 @@ pub fn RuntimeCanvasWidgetEvents(comptime Runtime: type) type {
                 };
             keyboard_event.keyboard.edit = edit;
 
+            if (self.views[index].canvasWidgetTextEditNeedsLargeStorage(target.id, edit)) {
+                for (self.views[0 .. index + 1]) |*view| {
+                    try view.ensureLargeCanvasWidgetTextStorage(self.owned_allocator);
+                }
+            }
+
             const dirty = if (keyboard_event.history_replay)
                 try self.views[index].applyCanvasWidgetTextEditWithoutHistory(target.id, edit) orelse return
             else
@@ -2370,17 +2391,17 @@ pub fn RuntimeCanvasWidgetEvents(comptime Runtime: type) type {
         }
 
         /// Returns true for an auto-repeat or release belonging to the
-        /// physical Tab gesture that moved focus into a live terminal.
+        /// physical Tab gesture that moved focus into a Tab-owning editor.
         /// The caller suppresses that transition; the release also
         /// retires the gesture latch.
-        pub fn consumeCanvasWidgetTerminalFocusEntryTab(self: *Runtime, input_event: GpuSurfaceInputEvent) bool {
+        pub fn consumeCanvasWidgetTabInputFocusEntry(self: *Runtime, input_event: GpuSurfaceInputEvent) bool {
             if (input_event.kind != .key_down and input_event.kind != .key_up) return false;
             if (!std.ascii.eqlIgnoreCase(input_event.key, "tab")) return false;
             const index = runtimeFindViewIndex(self, input_event.window_id, input_event.label) orelse return false;
             if (self.views[index].kind != .gpu_surface) return false;
-            if (!self.views[index].canvas_widget_terminal_focus_entry_tab_held) return false;
+            if (!self.views[index].canvas_widget_tab_input_focus_entry_held) return false;
             if (input_event.kind == .key_up) {
-                self.views[index].canvas_widget_terminal_focus_entry_tab_held = false;
+                self.views[index].canvas_widget_tab_input_focus_entry_held = false;
             }
             return true;
         }
@@ -2415,18 +2436,21 @@ pub fn RuntimeCanvasWidgetEvents(comptime Runtime: type) type {
             const current_id: ?canvas.ObjectId = if (self.views[index].canvas_widget_focused_id == 0) null else self.views[index].canvas_widget_focused_id;
             const layout = self.views[index].widgetLayoutTree();
             if (std.ascii.eqlIgnoreCase(input_event.key, "tab")) {
-                // A terminal owns Tab as INPUT (completion, indentation,
-                // and TUI navigation), not as focus traversal. Decide
-                // against the pre-key focus before choosing the next
-                // target: the routed keyboard pass below will therefore
-                // address this same terminal and its emulator can encode
-                // Tab/Shift+Tab for the pty. Disabled/hidden terminals
-                // cannot occupy the focus register because
-                // focusTargetById rejects them, so stale focus still
-                // falls through to the ordinary traversal repair.
+                // Live terminals own Tab/Shift+Tab as input; editable code
+                // owns plain Tab as indentation while Shift+Tab remains an
+                // accessible way to leave the editor.
                 if (current_id) |id| {
                     if (layout.focusTargetById(id)) |current| {
                         if (canvasWidgetTerminalOwnsTabInput(layout, current)) return false;
+                        if (!input_event.modifiers.shift and
+                            !input_event.modifiers.primary and
+                            !input_event.modifiers.command and
+                            !input_event.modifiers.control and
+                            !input_event.modifiers.option and
+                            canvasWidgetCodeEditorOwnsTabInput(layout, current))
+                        {
+                            return false;
+                        }
                     }
                 }
                 const direction: canvas.WidgetFocusDirection = if (input_event.modifiers.shift) .backward else .forward;
@@ -2435,13 +2459,14 @@ pub fn RuntimeCanvasWidgetEvents(comptime Runtime: type) type {
                 else
                     layout.focusTarget(current_id, direction) orelse return false;
                 const moved = try setCanvasWidgetFocusFromKeyboardMoved(self, index, current_id, target.id);
-                if (moved and canvasWidgetTerminalOwnsTabInput(layout, target)) {
-                    // The key-down moved focus INTO this live terminal;
-                    // it is traversal, not terminal input. Hold that
-                    // classification through auto-repeat and key-up so
-                    // the same physical gesture cannot leak a Tab press
-                    // (legacy) or orphan release (kitty) into the pty.
-                    self.views[index].canvas_widget_terminal_focus_entry_tab_held = true;
+                if (moved and
+                    (canvasWidgetTerminalOwnsTabInput(layout, target) or
+                        canvasWidgetCodeEditorOwnsTabInput(layout, target)))
+                {
+                    // The key-down entered this input owner through focus
+                    // traversal. Hold that classification through repeats
+                    // and key-up so the gesture never becomes editor input.
+                    self.views[index].canvas_widget_tab_input_focus_entry_held = true;
                 }
                 return moved;
             }
@@ -2585,6 +2610,12 @@ fn canvasWidgetTerminalOwnsTabInput(layout: canvas.WidgetLayoutTree, target: can
     if (terminal.pty == 0) return false;
     const grid = terminal.grid orelse return false;
     return grid.running;
+}
+
+fn canvasWidgetCodeEditorOwnsTabInput(layout: canvas.WidgetLayoutTree, target: canvas.WidgetFocusTarget) bool {
+    if (target.kind != .textarea or target.index >= layout.nodes.len) return false;
+    const widget = layout.nodes[target.index].widget;
+    return widget.code_editor and !widget.state.disabled;
 }
 
 fn canvasDirtyRegionForView(view_frame: geometry.RectF, local_dirty: geometry.RectF) ?geometry.RectF {

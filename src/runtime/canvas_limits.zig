@@ -1,3 +1,5 @@
+const canvas = @import("canvas");
+
 // Per-view canvas budgets. Fixed, documented, loud: capacities are compile
 // time constants sized for a dense desktop view, overflow errors name the
 // budget, and the automation snapshot reports headroom (widget_nodes=N/MAX).
@@ -169,12 +171,16 @@ pub const max_registered_canvas_font_bytes: usize = 24 * 1024 * 1024;
 // lockstep.
 pub const max_canvas_widget_nodes_per_view: usize = 1024;
 pub const max_canvas_widget_semantics_per_view: usize = 1024;
-// Raised from 2048 with the inline-span/markdown work: a rendered document
-// retains its full plain text (paragraph bytes are stored once; span slices
-// rebase into them) plus link payloads, and 2048 bytes could not hold a
-// README-sized document. Raised again with the node-budget raise:
-// a 1024-node view retains proportionally more text.
-pub const max_canvas_widget_text_bytes_per_view: usize = 65536;
+// Raised from 2048 with the inline-span/markdown work, then from 64 KiB for
+// editable code surfaces: a simple editor must retain a practical source
+// file (roughly 10k ordinary code lines) plus the surrounding view chrome.
+// Syntax paint remains viewport-bounded, so this larger SOURCE budget does
+// not enlarge the display list or retained span pools.
+pub const max_canvas_widget_text_bytes_per_view: usize = canvas.max_widget_text_bytes_per_view;
+/// Ordinary views retain the historical 64 KiB pools inline. A view upgrades
+/// to the practical source-file ceiling above only when its adopted layout
+/// actually needs it, so empty/ordinary view creation remains allocation-free.
+pub const max_canvas_widget_inline_text_bytes_per_view: usize = 64 * 1024;
 pub const max_canvas_widget_source_text_entries_per_view: usize = 256;
 /// Retained editor undo/redo is delta-based: changed bytes share this
 /// per-view pool and metadata stays bounded independently. Matching the
@@ -182,6 +188,7 @@ pub const max_canvas_widget_source_text_entries_per_view: usize = 256;
 /// be undone; an unusually large whole-document replacement whose removed
 /// plus inserted bytes exceed the pool simply starts a fresh history.
 pub const max_canvas_widget_text_history_bytes_per_view: usize = max_canvas_widget_text_bytes_per_view;
+pub const max_canvas_widget_inline_text_history_bytes_per_view: usize = 64 * 1024;
 pub const max_canvas_widget_text_history_entries_per_view: usize = 128;
 // Inline styled runs retained across all `.text` widgets of a view. Each
 // span is a small struct (style flags + slices into the widget text

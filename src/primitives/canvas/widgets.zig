@@ -3,6 +3,7 @@ const geometry = @import("geometry");
 const canvas = @import("root.zig");
 const text_model = @import("text.zig");
 const text_spans_model = @import("text_spans.zig");
+const code_model = @import("code.zig");
 const token_model = @import("tokens.zig");
 const chart_model = @import("chart.zig");
 const terminal_grid_model = @import("terminal_grid.zig");
@@ -870,6 +871,30 @@ pub const Widget = struct {
     /// Stamped only by `Ui.code`; there is no generic builder/markup
     /// channel for turning arbitrary paragraphs into numbered code.
     code_line_number_digits: u8 = 0,
+    /// Optional one-based logical depth for a flat sequence of tree rows.
+    /// Zero keeps the structural nesting contract. A nonzero value lets a
+    /// `<for>` render visible rows as siblings while Left/Right still find
+    /// the logical parent and first child from their declared levels.
+    tree_level: u16 = 0,
+    /// Internal marker for an editable `Ui.code` surface. The widget keeps
+    /// the `.textarea` kind so the existing editor, IME, clipboard, undo,
+    /// selection, and accessibility paths all apply; this bit only swaps
+    /// the textarea's visual/geometry policy to bare monospace highlighted
+    /// code (no control fill, border, radius, focus ring, or inset).
+    code_editor: bool = false,
+    /// Syntax grammar for an editable `Ui.code` surface. Editable code
+    /// retains one plain source span and tokenizes only visible logical
+    /// lines during paint, so large documents do not consume the view's
+    /// bounded span pool on offscreen syntax runs.
+    code_language: code_model.Language = .plain,
+    /// Runtime-owned longest-line measurement for an editable no-wrap code
+    /// surface. The signature keeps the value honest across font/appearance
+    /// changes; source edits invalidate it before caret and scroll geometry
+    /// read it. These fields are renderer state, not builder options.
+    code_content_width: f32 = 0,
+    code_content_width_generation: u64 = 0,
+    code_content_width_font_id: u64 = 0,
+    code_content_width_size_bits: u32 = 0,
     /// Nonzero on bounded paragraph chunks that together present one
     /// selectable source-code document. The group id is the structural id
     /// of their internal parent; offsets order each chunk's exact source

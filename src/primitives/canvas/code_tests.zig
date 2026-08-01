@@ -4,6 +4,7 @@ const geometry = @import("geometry");
 const canvas = @import("root.zig");
 const text_spans = @import("text_spans.zig");
 const ui_model = @import("ui.zig");
+const widget_metrics = @import("widget_metrics.zig");
 
 const testing = std.testing;
 const Ui = ui_model.Ui(enum { noop });
@@ -11,6 +12,15 @@ const Ui = ui_model.Ui(enum { noop });
 fn spanWithFragment(spans: []const canvas.TextSpan, fragment: []const u8) ?canvas.TextSpan {
     for (spans) |span| {
         if (std.mem.indexOf(u8, span.text, fragment) != null) return span;
+    }
+    return null;
+}
+
+fn colorAtOffset(spans: []const canvas.TextSpan, offset: usize) ?canvas.TextSpanColor {
+    var cursor: usize = 0;
+    for (spans) |span| {
+        if (offset < cursor + span.text.len) return span.color;
+        cursor += span.text.len;
     }
     return null;
 }
@@ -59,6 +69,32 @@ fn displayListTextBytes(display_list: canvas.DisplayList) usize {
     return count;
 }
 
+fn codeFontSensitiveMeasure(context: ?*anyopaque, font_id: canvas.FontId, size: f32, text: []const u8) f32 {
+    _ = context;
+    const advance: f32 = if (font_id == canvas.default_mono_font_id) 1 else 0.1;
+    return size * advance * @as(f32, @floatFromInt(text.len));
+}
+
+const code_font_sensitive_measure = canvas.TextMeasureProvider{ .measure_fn = codeFontSensitiveMeasure };
+
+const CodeWidthMeasure = struct {
+    width_calls: usize = 0,
+    advance_calls: usize = 0,
+
+    fn width(context: ?*anyopaque, _: canvas.FontId, size: f32, text: []const u8) f32 {
+        const self: *CodeWidthMeasure = @ptrCast(@alignCast(context.?));
+        self.width_calls += 1;
+        return size * @as(f32, @floatFromInt(text.len));
+    }
+
+    fn advances(context: ?*anyopaque, _: canvas.FontId, size: f32, text: []const u8, out: []f32) bool {
+        const self: *CodeWidthMeasure = @ptrCast(@alignCast(context.?));
+        self.advance_calls += 1;
+        for (text, 0..) |byte, index| out[index] = if (byte == '\n') 0 else size;
+        return true;
+    }
+};
+
 fn expectCompleteSpanLayouts(widget: canvas.Widget) !void {
     if (widget.kind == .text and widget.spans.len > 0) {
         var runs: [text_spans.max_text_span_runs_per_paragraph]text_spans.TextSpanRun = undefined;
@@ -85,6 +121,21 @@ fn allTextSpansHaveColor(widget: canvas.Widget, color: canvas.TextSpanColor) boo
     return true;
 }
 
+fn expectCodeTabInsertion(source: []const u8, expected: []const u8) !void {
+    const edit = canvas.widgetCodeTabTextEditEvent(.{
+        .kind = .textarea,
+        .code_editor = true,
+        .text = source,
+    }, .{
+        .phase = .key_down,
+        .key = "tab",
+    }).?;
+    switch (edit) {
+        .insert_text => |text| try testing.expectEqualStrings(expected, text),
+        else => return error.TestExpectedEqual,
+    }
+}
+
 test "HTML and JSX highlighting distinguishes tags attributes expressions and strings" {
     const source =
         \\<Accordion defaultValue={["item-1"]}>
@@ -94,12 +145,65 @@ test "HTML and JSX highlighting distinguishes tags attributes expressions and st
     var storage: [text_spans.max_text_spans_per_paragraph]canvas.TextSpan = undefined;
     const spans = code_model.highlight(source, code_model.languageFromName("tsx"), &storage);
 
-    try testing.expectEqual(code_model.Language.html, code_model.languageFromName("jsx"));
+    try testing.expectEqual(code_model.Language.jsx, code_model.languageFromName("jsx"));
+    try testing.expectEqual(code_model.Language.tsx, code_model.languageFromName("tsx"));
+    try testing.expectEqual(code_model.Language.javascript, code_model.languageFromName("mjs"));
+    try testing.expectEqual(code_model.Language.yaml, code_model.languageFromName("yaml"));
+    try testing.expectEqual(code_model.Language.yaml, code_model.languageFromName("yml"));
+    try testing.expectEqual(code_model.Language.markdown, code_model.languageFromName("md"));
     try testing.expectEqual(canvas.TextSpanColor.syntax_literal, spanWithFragment(spans, "Accordion").?.color.?);
     try testing.expectEqual(canvas.TextSpanColor.syntax_function, spanWithFragment(spans, "defaultValue").?.color.?);
     try testing.expectEqual(canvas.TextSpanColor.syntax_literal, spanWithFragment(spans, "\"item-1\"").?.color.?);
     try testing.expectEqual(canvas.TextSpanColor.syntax_literal, spanWithFragment(spans, "true").?.color.?);
     try testing.expectEqual(canvas.TextSpanColor.syntax_plain, spanWithFragment(spans, "Accessible?").?.color.?);
+}
+
+test "YAML highlighting distinguishes mapping keys scalars symbols and comments" {
+    const source =
+        \\---
+        \\name: native
+        \\runs-on: macos-15
+        \\enabled: true
+        \\empty: ~
+        \\defaults: &defaults
+        \\command: "zig build test"
+        \\use: *defaults
+        \\url: https://example.test/#section # trailing comment
+    ;
+    var storage: [text_spans.max_text_spans_per_paragraph]canvas.TextSpan = undefined;
+    const spans = code_model.highlight(source, .yaml, &storage);
+
+    try testing.expectEqual(canvas.TextSpanColor.syntax_keyword, spanWithFragment(spans, "---").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_property, spanWithFragment(spans, "name").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_property, spanWithFragment(spans, "runs-on").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_literal, spanWithFragment(spans, "true").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_literal, spanWithFragment(spans, "~").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_constant, spanWithFragment(spans, "&defaults").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_constant, spanWithFragment(spans, "*defaults").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_literal, spanWithFragment(spans, "\"zig build test\"").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_plain, spanWithFragment(spans, "#section").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_comment, spanWithFragment(spans, "# trailing comment").?.color.?);
+}
+
+test "TSX highlights top-level TypeScript and embedded JSX in one grammar" {
+    const source =
+        \\import type { Metadata } from "next";
+        \\export default function RootLayout() { return <html lang="en" />; }
+    ;
+    var storage: [text_spans.max_text_spans_per_paragraph]canvas.TextSpan = undefined;
+    const spans = code_model.highlight(source, .tsx, &storage);
+
+    inline for (.{ "import", "type", "from", "export", "default", "function", "return" }) |keyword| {
+        try testing.expectEqual(
+            canvas.TextSpanColor.syntax_keyword,
+            spanWithFragment(spans, keyword).?.color.?,
+        );
+    }
+    try testing.expectEqual(canvas.TextSpanColor.syntax_literal, spanWithFragment(spans, "\"next\"").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_function, spanWithFragment(spans, "RootLayout").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_literal, spanWithFragment(spans, "html").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_function, spanWithFragment(spans, "lang").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_literal, spanWithFragment(spans, "\"en\"").?.color.?);
 }
 
 test "JSX relational less-than preserves expression state and nested tags" {
@@ -122,6 +226,83 @@ test "JSX relational less-than preserves expression state and nested tags" {
     try testing.expectEqual(canvas.TextSpanColor.syntax_plain, spanWithFragment(second, "limit").?.color.?);
     try testing.expectEqual(@as(usize, 0), chunked_state.html_expression_depth);
     try testing.expect(!chunked_state.html_in_tag);
+}
+
+test "TSX relational less-than at top level does not open a tag" {
+    const source = "const ok=count<limit; const later=true;";
+    var state: code_model.HighlightState = .{};
+    var storage: [text_spans.max_text_spans_per_paragraph]canvas.TextSpan = undefined;
+    const spans = code_model.highlightWithState(source, .tsx, &storage, &state);
+
+    try testing.expectEqual(canvas.TextSpanColor.syntax_plain, spanWithFragment(spans, "limit").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_keyword, spanWithFragment(spans, "const").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_literal, spanWithFragment(spans, "true").?.color.?);
+    try testing.expect(!state.html_in_tag);
+
+    var chunked_state: code_model.HighlightState = .{};
+    var first_storage: [text_spans.max_text_spans_per_paragraph]canvas.TextSpan = undefined;
+    _ = code_model.highlightWithState("const ok=count", .tsx, &first_storage, &chunked_state);
+    var second_storage: [text_spans.max_text_spans_per_paragraph]canvas.TextSpan = undefined;
+    const second = code_model.highlightWithState("<limit; const later=true;", .tsx, &second_storage, &chunked_state);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_plain, spanWithFragment(second, "limit").?.color.?);
+    try testing.expect(!chunked_state.html_in_tag);
+}
+
+test "JSX closing tags remain structural after plain text" {
+    const source = "const view = <div>Hello<span>world</span></div>; const later = true;";
+    var state: code_model.HighlightState = .{};
+    var storage: [text_spans.max_text_spans_per_paragraph]canvas.TextSpan = undefined;
+    const spans = code_model.highlightWithState(source, .tsx, &storage, &state);
+    const closing_name = std.mem.lastIndexOf(u8, source, "div").?;
+    const nested_opening_name = std.mem.indexOf(u8, source, "span").?;
+    const nested_closing_name = std.mem.lastIndexOf(u8, source, "span").?;
+    const later_name = std.mem.indexOf(u8, source, "later").?;
+
+    try testing.expectEqual(canvas.TextSpanColor.syntax_literal, colorAtOffset(spans, closing_name).?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_literal, colorAtOffset(spans, nested_opening_name).?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_literal, colorAtOffset(spans, nested_closing_name).?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_plain, colorAtOffset(spans, later_name).?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_literal, spanWithFragment(spans, "true").?.color.?);
+    try testing.expectEqual(@as(usize, 0), state.html_element_len);
+    try testing.expect(!state.html_in_tag);
+}
+
+test "JSX regex comparisons inside elements do not become closing tags" {
+    const source = "const view = <div>{value</x/.test(text) ? 'yes' : 'no'}</div>;";
+    var state: code_model.HighlightState = .{};
+    var storage: [text_spans.max_text_spans_per_paragraph]canvas.TextSpan = undefined;
+    const spans = code_model.highlightWithState(source, .tsx, &storage, &state);
+    const regex_name = std.mem.indexOf(u8, source, "x/").?;
+    const closing_name = std.mem.lastIndexOf(u8, source, "div").?;
+
+    try testing.expectEqual(canvas.TextSpanColor.syntax_plain, colorAtOffset(spans, regex_name).?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_literal, colorAtOffset(spans, closing_name).?);
+    try testing.expectEqual(@as(usize, 0), state.html_element_len);
+    try testing.expectEqual(@as(usize, 0), state.html_expression_depth);
+    try testing.expect(!state.html_in_tag);
+}
+
+test "Markdown highlighting distinguishes structure links code and comments" {
+    const source =
+        \\# Heading
+        \\- [Native](https://native.dev) uses `code` and **emphasis**.
+        \\<!-- note -->
+        \\```zig
+        \\const value = true;
+        \\```
+    ;
+    var storage: [text_spans.max_text_spans_per_paragraph]canvas.TextSpan = undefined;
+    const spans = code_model.highlight(source, .markdown, &storage);
+
+    try testing.expectEqual(canvas.TextSpanColor.syntax_keyword, spanWithFragment(spans, "#").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_keyword, spanWithFragment(spans, "-").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_property, spanWithFragment(spans, "[").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_literal, spanWithFragment(spans, "https://native.dev").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_literal, spanWithFragment(spans, "`code`").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_keyword, spanWithFragment(spans, "**").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_comment, spanWithFragment(spans, "<!-- note -->").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_constant, spanWithFragment(spans, "zig").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_literal, spanWithFragment(spans, "const value").?.color.?);
 }
 
 test "nested JSX attribute tags restore the enclosing opening tag" {
@@ -273,15 +454,26 @@ test "token-dense fallback still updates lexer state" {
     try testing.expectEqual(canvas.TextSpanColor.syntax_keyword, spanWithFragment(second, "const").?.color.?);
 }
 
-test "callables and object properties use Geist syntax roles" {
-    const source = "function render() { return { color: true }; }";
+test "callables and object keys use variable syntax roles" {
+    const source = "function render() { const variable = { color: true }; return variable; }";
     var storage: [text_spans.max_text_spans_per_paragraph]canvas.TextSpan = undefined;
     const spans = code_model.highlight(source, .javascript, &storage);
 
     try testing.expectEqual(canvas.TextSpanColor.syntax_keyword, spanWithFragment(spans, "function").?.color.?);
     try testing.expectEqual(canvas.TextSpanColor.syntax_function, spanWithFragment(spans, "render").?.color.?);
-    try testing.expectEqual(canvas.TextSpanColor.syntax_property, spanWithFragment(spans, "color").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_plain, spanWithFragment(spans, "variable").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_plain, spanWithFragment(spans, "color").?.color.?);
     try testing.expectEqual(canvas.TextSpanColor.syntax_literal, spanWithFragment(spans, "true").?.color.?);
+
+    const typed_source = "const options: { enabled: boolean } = { enabled: true };";
+    var typed_storage: [text_spans.max_text_spans_per_paragraph]canvas.TextSpan = undefined;
+    const typed_spans = code_model.highlight(typed_source, .typescript, &typed_storage);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_plain, spanWithFragment(typed_spans, "options").?.color.?);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_plain, spanWithFragment(typed_spans, "enabled").?.color.?);
+
+    var css_storage: [text_spans.max_text_spans_per_paragraph]canvas.TextSpan = undefined;
+    const css_spans = code_model.highlight("body { color: red; }", .css, &css_storage);
+    try testing.expectEqual(canvas.TextSpanColor.syntax_property, spanWithFragment(css_spans, "color").?.color.?);
 }
 
 test "both built-in packs use the Geist Code Block syntax palette" {
@@ -328,7 +520,11 @@ test "code wraps by default and no-wrap composes one horizontal scroller" {
     defer wrapped_arena.deinit();
     var wrapped_ui = Ui.init(wrapped_arena.allocator());
     const wrapped = try wrapped_ui.finalize(wrapped_ui.code(.{ .language = .zig }, "const answer: u32 = 42;"));
-    try testing.expectEqual(canvas.WidgetKind.panel, wrapped.root.kind);
+    try testing.expectEqual(canvas.WidgetKind.column, wrapped.root.kind);
+    try testing.expectEqual(geometry.InsetsF{}, wrapped.root.layout.padding);
+    try testing.expect(wrapped.root.style.background == null);
+    try testing.expect(wrapped.root.style.border == null);
+    try testing.expect(wrapped.root.style.radius == null);
     try testing.expect(findByKind(wrapped.root, .scroll_view) == null);
     const wrapped_text = findByKind(wrapped.root, .text).?;
     try testing.expect(!wrapped_text.text_no_wrap);
@@ -355,6 +551,71 @@ test "code wraps by default and no-wrap composes one horizontal scroller" {
         if (node.widget.kind == .text) text_width = node.frame.width;
     }
     try testing.expect(text_width > scroll_width);
+}
+
+test "editable code layout paints syntax-highlighted token runs" {
+    const source = "const answer: u32 = 42;";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ui = Ui.init(arena.allocator());
+    const view = try ui.finalize(ui.code(.{
+        .language = .zig,
+        .editable = true,
+        .width = 320,
+        .height = 80,
+    }, source));
+
+    var nodes: [8]canvas.WidgetLayoutNode = undefined;
+    const layout = try canvas.layoutWidgetTree(
+        view.root,
+        geometry.RectF.init(0, 0, 320, 80),
+        &nodes,
+    );
+    const tokens = canvas.DesignTokens{};
+    var commands: [64]canvas.CanvasCommand = undefined;
+    var builder = canvas.Builder.init(&commands);
+    try canvas.emitWidgetLayout(&builder, layout, tokens);
+
+    var saw_keyword = false;
+    var saw_type = false;
+    var saw_literal = false;
+    for (builder.displayList().commands) |command| {
+        switch (command) {
+            .draw_text => |draw| {
+                if (std.mem.eql(u8, draw.text, "const")) {
+                    try testing.expectEqual(tokens.colors.syntax_keyword, draw.color);
+                    saw_keyword = true;
+                } else if (std.mem.eql(u8, draw.text, "u32")) {
+                    try testing.expectEqual(tokens.colors.syntax_literal, draw.color);
+                    saw_type = true;
+                } else if (std.mem.eql(u8, draw.text, "42")) {
+                    try testing.expectEqual(tokens.colors.syntax_literal, draw.color);
+                    saw_literal = true;
+                }
+            },
+            else => {},
+        }
+    }
+    try testing.expect(saw_keyword);
+    try testing.expect(saw_type);
+    try testing.expect(saw_literal);
+
+    var selected_editor = view.root;
+    // Runtime-owned text storage can be distinct from the highlighted
+    // spans' source storage between an edit and the controlled rebuild.
+    selected_editor.text = try arena.allocator().dupe(u8, source);
+    selected_editor.text_selection = .{ .anchor = 2, .focus = 12 };
+    selected_editor.state.focused = false;
+    const selected_layout = try canvas.layoutWidgetTree(
+        selected_editor,
+        geometry.RectF.init(0, 0, 320, 80),
+        &nodes,
+    );
+    var selected_commands: [64]canvas.CanvasCommand = undefined;
+    var selected_builder = canvas.Builder.init(&selected_commands);
+    try canvas.emitWidgetLayout(&selected_builder, selected_layout, tokens);
+    var changes: [64]canvas.DiffChange = undefined;
+    _ = try canvas.DisplayList.diff(.{}, selected_builder.displayList(), &changes);
 }
 
 test "unwrapped multiline code hugs the height of every logical line" {
@@ -520,6 +781,515 @@ test "line numbers are opt-in and stay paired with logical source lines" {
     try testing.expectEqual(canvas.TextSpanColor.syntax_keyword, spanWithFragment(comment_text.spans, "const").?.color.?);
 }
 
+test "line number gutter reserves at least three marker columns" {
+    const tokens = canvas.DesignTokens{};
+    var numbered = canvas.Widget{
+        .kind = .textarea,
+        .code_editor = true,
+        .code_line_number_digits = 1,
+    };
+    const one_digit_width = widget_metrics.widgetCodeLineNumberGutterWidth(numbered, tokens);
+    numbered.code_line_number_digits = 3;
+    const three_digit_width = widget_metrics.widgetCodeLineNumberGutterWidth(numbered, tokens);
+    numbered.code_line_number_digits = 4;
+    const four_digit_width = widget_metrics.widgetCodeLineNumberGutterWidth(numbered, tokens);
+
+    try testing.expectEqual(three_digit_width, one_digit_width);
+    try testing.expect(four_digit_width > three_digit_width);
+}
+
+test "editable line-number gutter masks horizontally scrolled source" {
+    const source = "const deliberately_long_identifier = another_deliberately_long_identifier;\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ui = Ui.init(arena.allocator());
+    const view = try ui.finalize(ui.code(.{
+        .language = .zig,
+        .editable = true,
+        .line_numbers = true,
+        .wrap = false,
+        .height = 80,
+    }, source));
+    var editor = findByText(view.root, source).?;
+    editor.frame = geometry.RectF.init(0, 0, 220, 80);
+    editor.value_x = 48;
+
+    const tokens = canvas.DesignTokens{};
+    var commands: [128]canvas.CanvasCommand = undefined;
+    var builder = canvas.Builder.init(&commands);
+    try canvas.emitWidgetTree(&builder, editor, tokens);
+
+    var source_index: ?usize = null;
+    var gutter_index: ?usize = null;
+    var marker_index: ?usize = null;
+    var gutter_rect: ?geometry.RectF = null;
+    for (builder.displayList().commands, 0..) |command, index| {
+        switch (command) {
+            .fill_rect => |fill| {
+                if (std.meta.eql(fill.fill.color, tokens.colors.background)) {
+                    gutter_index = index;
+                    gutter_rect = fill.rect;
+                }
+            },
+            .draw_text => |draw| {
+                if (std.mem.eql(u8, draw.text, "1") or std.mem.eql(u8, draw.text, "2")) {
+                    marker_index = index;
+                } else {
+                    source_index = index;
+                }
+            },
+            else => {},
+        }
+    }
+
+    try testing.expect(source_index != null);
+    try testing.expect(gutter_index != null);
+    try testing.expect(marker_index != null);
+    try testing.expect(source_index.? < gutter_index.?);
+    try testing.expect(gutter_index.? < marker_index.?);
+    try testing.expectEqual(editor.frame.x, gutter_rect.?.x);
+    try testing.expectEqual(editor.frame.y, gutter_rect.?.y);
+    try testing.expect(gutter_rect.?.width > 0);
+    try testing.expectEqual(editor.frame.height, gutter_rect.?.height);
+}
+
+test "wrapped numbered editable code emits one retained gutter" {
+    const source = "alpha beta gamma delta epsilon zeta eta theta";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ui = Ui.init(arena.allocator());
+    const view = try ui.finalize(ui.code(.{
+        .language = .plain,
+        .editable = true,
+        .line_numbers = true,
+        .wrap = true,
+    }, source));
+    var editor = findByText(view.root, source).?;
+    editor.frame = geometry.RectF.init(0, 0, 120, 80);
+
+    var commands: [256]canvas.CanvasCommand = undefined;
+    var builder = canvas.Builder.init(&commands);
+    try canvas.emitWidgetTree(&builder, editor, .{});
+
+    var line_one_count: usize = 0;
+    for (builder.displayList().commands) |command| {
+        if (command == .draw_text and std.mem.eql(u8, command.draw_text.text, "1")) {
+            line_one_count += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), line_one_count);
+
+    var changes: [256]canvas.DiffChange = undefined;
+    _ = try canvas.DisplayList.diff(.{}, builder.displayList(), &changes);
+}
+
+test "wrapped editable code re-highlights runtime-owned text" {
+    const source = "const stale = true;";
+    const edited = "fn fresh() void {}";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ui = Ui.init(arena.allocator());
+    const view = try ui.finalize(ui.code(.{
+        .language = .zig,
+        .editable = true,
+        .wrap = true,
+    }, source));
+    var editor = findByText(view.root, source).?;
+    editor.text = edited;
+    editor.frame = geometry.RectF.init(0, 0, 300, 80);
+
+    var commands: [256]canvas.CanvasCommand = undefined;
+    var builder = canvas.Builder.init(&commands);
+    try canvas.emitWidgetTree(&builder, editor, .{});
+
+    var rendered: std.ArrayListUnmanaged(u8) = .empty;
+    defer rendered.deinit(testing.allocator);
+    for (builder.displayList().commands) |command| {
+        if (command == .draw_text) try rendered.appendSlice(testing.allocator, command.draw_text.text);
+    }
+    try testing.expectEqualStrings(edited, rendered.items);
+}
+
+test "wrapped editable code preserves syntax after the document exhausts the span budget" {
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    defer source.deinit(testing.allocator);
+    for (0..40) |index| {
+        var line_buffer: [64]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buffer, "const value_{d} = \"ordinary\";\n", .{index});
+        try source.appendSlice(testing.allocator, line);
+    }
+    try source.appendSlice(testing.allocator, "const tail = \"TAIL_SENTINEL\";");
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ui = Ui.init(arena.allocator());
+    const view = try ui.finalize(ui.code(.{
+        .language = .zig,
+        .editable = true,
+        .wrap = true,
+    }, source.items));
+    var editor = findByText(view.root, source.items).?;
+    editor.frame = geometry.RectF.init(0, 0, 800, 1_000);
+
+    const tokens = canvas.DesignTokens{};
+    var commands: [512]canvas.CanvasCommand = undefined;
+    var builder = canvas.Builder.init(&commands);
+    try canvas.emitWidgetTree(&builder, editor, tokens);
+
+    var tail_color: ?canvas.Color = null;
+    for (builder.displayList().commands) |command| {
+        if (command != .draw_text) continue;
+        if (std.mem.indexOf(u8, command.draw_text.text, "TAIL_SENTINEL") != null) {
+            tail_color = command.draw_text.color;
+            break;
+        }
+    }
+    try testing.expectEqual(tokens.colors.syntax_literal, tail_color.?);
+}
+
+test "wrapped editable code paints the visible tail of an over-capacity logical line" {
+    const source = ("x" ** (text_spans.max_text_span_lines_per_paragraph * 2 + 8)) ++ "Z";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ui = Ui.init(arena.allocator());
+    const view = try ui.finalize(ui.code(.{
+        .language = .plain,
+        .editable = true,
+        .wrap = true,
+    }, source));
+    var editor = findByText(view.root, source).?;
+
+    var measured = CodeWidthMeasure{};
+    const provider = canvas.TextMeasureProvider{
+        .context = &measured,
+        .measure_fn = CodeWidthMeasure.width,
+        .measure_advances_fn = CodeWidthMeasure.advances,
+    };
+    const tokens = canvas.DesignTokens{ .text_measure = &provider };
+    const line_height = tokens.typography.body_size * 1.25;
+    editor.frame = geometry.RectF.init(
+        0,
+        0,
+        tokens.typography.body_size * 2,
+        line_height * 2,
+    );
+    editor.value = canvas.textInputMaxScrollOffsetForWidget(editor, tokens);
+    try testing.expect(editor.value > line_height * text_spans.max_text_span_lines_per_paragraph);
+
+    var commands: [64]canvas.CanvasCommand = undefined;
+    var builder = canvas.Builder.init(&commands);
+    try canvas.emitWidgetTree(&builder, editor, tokens);
+
+    var saw_tail = false;
+    for (builder.displayList().commands) |command| {
+        if (command == .draw_text and std.mem.indexOfScalar(u8, command.draw_text.text, 'Z') != null) {
+            saw_tail = true;
+        }
+    }
+    try testing.expect(saw_tail);
+}
+
+test "editable code numbers the empty caret row after a terminal newline" {
+    const source = "alpha\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ui = Ui.init(arena.allocator());
+    const view = try ui.finalize(ui.code(.{
+        .language = .plain,
+        .editable = true,
+        .line_numbers = true,
+        .wrap = false,
+    }, source));
+    var editor = findByText(view.root, source).?;
+    editor.frame = geometry.RectF.init(0, 0, 300, 80);
+    try testing.expectEqual(@as(u8, 1), editor.code_line_number_digits);
+
+    var commands: [256]canvas.CanvasCommand = undefined;
+    var builder = canvas.Builder.init(&commands);
+    try canvas.emitWidgetTree(&builder, editor, .{});
+
+    var saw_second_line = false;
+    for (builder.displayList().commands) |command| {
+        if (command == .draw_text and std.mem.eql(u8, command.draw_text.text, "2")) {
+            saw_second_line = true;
+            break;
+        }
+    }
+    try testing.expect(saw_second_line);
+}
+
+test "wrapped editable code measures vertical extent with its monospace font" {
+    const source = "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ui = Ui.init(arena.allocator());
+    const view = try ui.finalize(ui.code(.{
+        .language = .plain,
+        .editable = true,
+        .line_numbers = true,
+        .wrap = true,
+    }, source));
+    var editor = findByText(view.root, source).?;
+    editor.frame = geometry.RectF.init(0, 0, 140, 20);
+    const tokens = canvas.DesignTokens{ .text_measure = &code_font_sensitive_measure };
+
+    try testing.expect(canvas.textInputContentExtentForWidget(editor, tokens) > editor.frame.height);
+    try testing.expect(canvas.textInputMaxScrollOffsetForWidget(editor, tokens) > 0);
+}
+
+test "wrapped editable code paints the caret row from the interaction width" {
+    const source = "ab";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ui = Ui.init(arena.allocator());
+    const view = try ui.finalize(ui.code(.{
+        .language = .plain,
+        .editable = true,
+        .wrap = true,
+    }, source));
+    var editor = findByText(view.root, source).?;
+
+    var measured = CodeWidthMeasure{};
+    const provider = canvas.TextMeasureProvider{
+        .context = &measured,
+        .measure_fn = CodeWidthMeasure.width,
+        .measure_advances_fn = CodeWidthMeasure.advances,
+    };
+    const tokens = canvas.DesignTokens{
+        .pixel_snap = .{ .geometry = true, .scale = 1 },
+        .text_measure = &provider,
+    };
+    const text_size = tokens.typography.body_size;
+    // The exact interaction width wraps the second glyph, while the static
+    // paragraph pixel hand-back would make both glyphs fit.
+    editor.frame = geometry.RectF.init(0, 0, text_size * 2 - 0.6, 80);
+    editor.state.focused = true;
+    editor.text_selection = canvas.TextSelection.collapsed(source.len);
+
+    var commands: [128]canvas.CanvasCommand = undefined;
+    var builder = canvas.Builder.init(&commands);
+    try canvas.emitWidgetTree(&builder, editor, tokens);
+
+    var final_glyph_baseline: ?f32 = null;
+    for (builder.displayList().commands) |command| {
+        if (command == .draw_text and std.mem.indexOfScalar(u8, command.draw_text.text, 'b') != null) {
+            final_glyph_baseline = command.draw_text.origin.y;
+        }
+    }
+    const caret = canvas.textGeometryForWidget(editor, tokens).caret_bounds.?;
+    try testing.expect(final_glyph_baseline != null);
+    try testing.expectApproxEqAbs(caret.y + text_size, final_glyph_baseline.?, 0.001);
+}
+
+test "numbered editable code does not invent trailing horizontal overflow" {
+    const source = "const concise = true;";
+    const tokens = canvas.DesignTokens{};
+    var editor = canvas.Widget{
+        .kind = .textarea,
+        .code_editor = true,
+        .code_line_number_digits = 2,
+        .text_no_wrap = true,
+        .text = source,
+        .frame = geometry.RectF.init(10, 12, 500, 80),
+    };
+
+    const broad_viewport = canvas.textInputViewportForWidget(editor, tokens).?;
+    const gutter = broad_viewport.x - editor.frame.x;
+    const text_width = canvas.measureTextWidthForFont(
+        tokens.text_measure,
+        tokens.typography.mono_font_id,
+        source,
+        tokens.typography.body_size,
+    );
+    // Exactly enough room for the gutter, source, and one-point caret.
+    editor.frame.width = gutter + text_width + 1;
+
+    const fitted_viewport = canvas.textInputViewportForWidget(editor, tokens).?;
+    try testing.expectApproxEqAbs(editor.frame.maxX(), fitted_viewport.maxX(), 0.001);
+    try testing.expectEqual(@as(f32, 0), canvas.textInputMaxHorizontalScrollOffsetForWidget(editor, tokens));
+    try testing.expectEqual(fitted_viewport.width, canvas.textInputContentWidthForWidget(editor, tokens));
+}
+
+test "editable code caches one batched longest-line measurement across geometry reads" {
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    defer source.deinit(testing.allocator);
+    for (0..1000) |index| {
+        var line_buffer: [48]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buffer, "const value_{d} = true;\n", .{index});
+        try source.appendSlice(testing.allocator, line);
+    }
+
+    var measured = CodeWidthMeasure{};
+    const provider = canvas.TextMeasureProvider{
+        .context = &measured,
+        .measure_fn = CodeWidthMeasure.width,
+        .measure_advances_fn = CodeWidthMeasure.advances,
+    };
+    const tokens = canvas.DesignTokens{ .text_measure = &provider };
+    var editor = canvas.Widget{
+        .kind = .textarea,
+        .code_editor = true,
+        .text_no_wrap = true,
+        .text = source.items,
+        .frame = geometry.RectF.init(0, 0, 240, 80),
+    };
+
+    canvas.cacheTextInputContentWidthForWidget(&editor, tokens);
+    canvas.cacheTextInputContentWidthForWidget(&editor, tokens);
+    for (0..4) |_| {
+        _ = canvas.textInputMaxHorizontalScrollOffsetForWidget(editor, tokens);
+        _ = canvas.textInputContentWidthForWidget(editor, tokens);
+    }
+
+    try testing.expectEqual(@as(usize, 1), measured.advance_calls);
+    try testing.expectEqual(@as(usize, 0), measured.width_calls);
+}
+
+test "editable code highlights the caret row but not a text selection" {
+    const source = "const first = 1;\nconst second = 2;\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ui = Ui.init(arena.allocator());
+    const view = try ui.finalize(ui.code(.{
+        .language = .zig,
+        .editable = true,
+        .line_numbers = true,
+        .wrap = false,
+        .height = 80,
+    }, source));
+    var editor = findByText(view.root, source).?;
+    editor.frame = geometry.RectF.init(0, 0, 220, 80);
+    editor.state.focused = true;
+    editor.text_selection = canvas.TextSelection.collapsed(std.mem.indexOf(u8, source, "second").?);
+
+    var tokens = canvas.DesignTokens{};
+    tokens.colors.surface_subtle = canvas.Color.rgb8(19, 23, 29);
+    var commands: [128]canvas.CanvasCommand = undefined;
+    var builder = canvas.Builder.init(&commands);
+    try canvas.emitWidgetTree(&builder, editor, tokens);
+
+    const caret = canvas.textGeometryForWidget(editor, tokens).caret_bounds.?;
+    var full_row_index: ?usize = null;
+    var source_index: ?usize = null;
+    var gutter_index: ?usize = null;
+    var gutter_row_index: ?usize = null;
+    var marker_index: ?usize = null;
+    var full_row: ?geometry.RectF = null;
+    var gutter_row: ?geometry.RectF = null;
+    for (builder.displayList().commands, 0..) |command, index| {
+        switch (command) {
+            .fill_rect => |fill| {
+                if (std.meta.eql(fill.fill.color, tokens.colors.surface_subtle)) {
+                    if (fill.rect.width == editor.frame.width) {
+                        full_row_index = index;
+                        full_row = fill.rect;
+                    } else {
+                        gutter_row_index = index;
+                        gutter_row = fill.rect;
+                    }
+                } else if (std.meta.eql(fill.fill.color, tokens.colors.background)) {
+                    gutter_index = index;
+                }
+            },
+            .draw_text => |draw| {
+                if (std.mem.eql(u8, draw.text, "2")) {
+                    marker_index = index;
+                } else if (!std.mem.eql(u8, draw.text, "1") and !std.mem.eql(u8, draw.text, "3")) {
+                    source_index = index;
+                }
+            },
+            else => {},
+        }
+    }
+
+    try testing.expect(full_row_index != null);
+    try testing.expect(source_index != null);
+    try testing.expect(gutter_index != null);
+    try testing.expect(gutter_row_index != null);
+    try testing.expect(marker_index != null);
+    try testing.expect(full_row_index.? < source_index.?);
+    try testing.expect(source_index.? < gutter_index.?);
+    try testing.expect(gutter_index.? < gutter_row_index.?);
+    try testing.expect(gutter_row_index.? < marker_index.?);
+    try testing.expectEqual(editor.frame.x, full_row.?.x);
+    try testing.expectEqual(editor.frame.width, full_row.?.width);
+    try testing.expectEqual(caret.y, full_row.?.y);
+    try testing.expectEqual(caret.height, full_row.?.height);
+    try testing.expectEqual(full_row.?.y, gutter_row.?.y);
+    try testing.expectEqual(full_row.?.height, gutter_row.?.height);
+    try testing.expect(gutter_row.?.width < full_row.?.width);
+
+    editor.text_selection = .{ .anchor = 0, .focus = 5 };
+    var selected_commands: [128]canvas.CanvasCommand = undefined;
+    var selected_builder = canvas.Builder.init(&selected_commands);
+    try canvas.emitWidgetTree(&selected_builder, editor, tokens);
+    for (selected_builder.displayList().commands) |command| {
+        if (command == .fill_rect) {
+            try testing.expect(!std.meta.eql(command.fill_rect.fill.color, tokens.colors.surface_subtle));
+        }
+    }
+
+    editor.text_selection = canvas.TextSelection.collapsed(0);
+    editor.state.focused = false;
+    var blurred_commands: [128]canvas.CanvasCommand = undefined;
+    var blurred_builder = canvas.Builder.init(&blurred_commands);
+    try canvas.emitWidgetTree(&blurred_builder, editor, tokens);
+    for (blurred_builder.displayList().commands) |command| {
+        if (command == .fill_rect) {
+            try testing.expect(!std.meta.eql(command.fill_rect.fill.color, tokens.colors.surface_subtle));
+        }
+    }
+}
+
+test "editable code Tab infers the file indentation and falls back to two spaces" {
+    try expectCodeTabInsertion("const answer = 42;\n", "  ");
+    try expectCodeTabInsertion(
+        \\if (ready) {
+        \\  while (running) {
+        \\    tick();
+        \\  }
+        \\}
+    , "  ");
+    try expectCodeTabInsertion(
+        \\if (ready) {
+        \\    while (running) {
+        \\        tick();
+        \\    }
+        \\}
+    , "    ");
+    try expectCodeTabInsertion(
+        "if (ready) {\n\twhile (running) {\n\t\ttick();\n\t}\n}\n",
+        "\t",
+    );
+
+    const plain_textarea = canvas.Widget{
+        .kind = .textarea,
+        .text = "plain",
+    };
+    try testing.expect(canvas.widgetCodeTabTextEditEvent(plain_textarea, .{
+        .phase = .key_down,
+        .key = "tab",
+    }) == null);
+    try testing.expect(canvas.widgetCodeTabTextEditEvent(.{
+        .kind = .textarea,
+        .code_editor = true,
+        .text = "code",
+    }, .{
+        .phase = .key_down,
+        .key = "tab",
+        .modifiers = .{ .shift = true },
+    }) == null);
+    try testing.expect(canvas.widgetCodeTabTextEditEvent(.{
+        .kind = .textarea,
+        .code_editor = true,
+        .text = "code",
+    }, .{
+        .phase = .key_down,
+        .key = "tab",
+        .focus_moved = true,
+    }) == null);
+}
+
 test "empty code retains the exact source text" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -654,6 +1424,32 @@ test "large code retains all source while emitting only visible text" {
     }
 }
 
+test "large editable code selection repaints only visible glyphs" {
+    const source = try testing.allocator.alloc(u8, 65_536);
+    defer testing.allocator.free(source);
+    @memset(source, 'x');
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ui = Ui.init(arena.allocator());
+    const view = try ui.finalize(ui.code(.{
+        .editable = true,
+        .wrap = false,
+        .height = 80,
+    }, source));
+    var editor = findByText(view.root, source).?;
+    editor.frame = geometry.RectF.init(0, 0, 320, 80);
+    editor.text_selection = .{ .anchor = 0, .focus = 5 };
+
+    var commands: [256]canvas.CanvasCommand = undefined;
+    var builder = canvas.Builder.init(&commands);
+    try canvas.emitWidgetTree(&builder, editor, .{});
+
+    const text_bytes = displayListTextBytes(builder.displayList());
+    try testing.expect(text_bytes <= canvas.max_display_list_text_bytes);
+    try testing.expect(text_bytes < source.len);
+}
+
 test "direct tree code emission honors scroll viewports and later layout pages" {
     const horizontal_source = "x" ** 65_536;
     const horizontal_spans = [_]canvas.TextSpan{.{
@@ -719,6 +1515,60 @@ test "direct tree code emission honors scroll viewports and later layout pages" 
         }
     }
     try testing.expect(visible_text_commands > 0);
+}
+
+test "editable code highlights the visible tail of a ten-thousand-line source" {
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    defer source.deinit(testing.allocator);
+    for (0..9_997) |_| {
+        try source.appendSlice(testing.allocator, ":root { --color: #fff; }\n");
+    }
+    try source.appendSlice(testing.allocator, "body {\n  color: red;\n}\n");
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ui = Ui.init(arena.allocator());
+    const view = try ui.finalize(ui.code(.{
+        .language = .css,
+        .editable = true,
+        .line_numbers = true,
+        .wrap = false,
+        .height = 100,
+    }, source.items));
+    var editor = findByText(view.root, source.items).?;
+    try testing.expect(editor.code_editor);
+    try testing.expectEqual(code_model.Language.css, editor.code_language);
+    try testing.expectEqual(@as(usize, 1), editor.spans.len);
+    try testing.expectEqual(@as(u8, 5), editor.code_line_number_digits);
+
+    const tokens = canvas.DesignTokens{};
+    const line_height = tokens.typography.body_size * 1.25;
+    editor.frame = geometry.RectF.init(0, 0, 500, 100);
+    editor.value = 9_997 * line_height;
+
+    var commands: [256]canvas.CanvasCommand = undefined;
+    var builder = canvas.Builder.init(&commands);
+    try canvas.emitWidgetTree(&builder, editor, tokens);
+
+    var saw_body = false;
+    var saw_property = false;
+    var saw_late_line_number = false;
+    for (builder.displayList().commands) |command| {
+        if (command != .draw_text) continue;
+        const draw = command.draw_text;
+        if (std.mem.eql(u8, draw.text, "body")) {
+            saw_body = true;
+            try testing.expectEqual(tokens.colors.syntax_literal, draw.color);
+        }
+        if (std.mem.eql(u8, draw.text, "color")) {
+            saw_property = true;
+            try testing.expectEqual(tokens.colors.syntax_property, draw.color);
+        }
+        if (std.mem.eql(u8, draw.text, "9998")) saw_late_line_number = true;
+    }
+    try testing.expect(saw_body);
+    try testing.expect(saw_property);
+    try testing.expect(saw_late_line_number);
 }
 
 test "maximal one-line numbered code adds no retained gutter bytes" {

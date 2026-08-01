@@ -304,8 +304,8 @@ pub const VirtualWindowRecord = struct {
 
 pub const UiHandlerEvent = enum {
     press,
-    /// A multi-click press (click_count >= 2 on the release): the
-    /// double-click channel. Resolution lives in `msgForPointerClick`:
+    /// The second release in a multi-click chain: the double-click
+    /// channel. Resolution lives in `msgForPointerClick`:
     /// a double-click release prefers this handler and falls back to
     /// `.press`, so binding it is strictly additive — the first click
     /// of every double-click still dispatches the single-press message
@@ -558,6 +558,10 @@ pub fn Ui(comptime Msg: type) type {
             /// via `on_toggle`). Model-owned: the view renders child
             /// rows only while expanded.
             expanded: ?bool = null,
+            /// One-based logical level for a flat tree-row sequence
+            /// (markup: `tree-level`). Zero derives hierarchy from widget
+            /// nesting, preserving the original structural tree contract.
+            tree_level: u16 = 0,
             disabled: bool = false,
             /// Image resource reference for image-bearing widgets
             /// (`image`, `icon_button`, `avatar`): a `canvas.ImageId` the
@@ -762,14 +766,14 @@ pub fn Ui(comptime Msg: type) type {
             /// the live bottom. Meaningless on every other element.
             scrollback: u32 = 0,
             on_press: ?Msg = null,
-            /// Double-click Msg (builder-only): dispatched on a release
-            /// whose click count reached 2, in place of `on_press` for
-            /// that release. The FIRST click of the double still
-            /// dispatches `on_press` on its own release, so the natural
-            /// pairing is select-on-press + act-on-double-press (a list
-            /// row that selects on click and opens/plays on double
-            /// click). Like `on_press`, binding it makes the element a
-            /// hit target and press claimer.
+            /// Double-click Msg (markup: `on-double-press`): dispatched
+            /// on a release whose click count reached 2, in place of
+            /// `on_press` for that release. The FIRST click of the double
+            /// still dispatches `on_press` on its own release, so the
+            /// natural pairing is select-on-press + act-on-double-press
+            /// (a list row that selects on click and opens/plays on double
+            /// click). Like `on_press`, binding it makes the element a hit
+            /// target and press claimer.
             on_double_press: ?Msg = null,
             on_toggle: ?Msg = null,
             on_change: ?Msg = null,
@@ -1359,14 +1363,14 @@ pub fn Ui(comptime Msg: type) type {
             }
 
             /// `msgForPointer` with the pointer's click count: a release
-            /// whose count reached 2 prefers the widget's `on_double_press`
+            /// whose count is exactly 2 prefers the widget's `on_double_press`
             /// handler and falls back to the ordinary press resolution
             /// (so a double-click on a widget without the double channel
             /// behaves exactly like two single clicks). This is the
             /// dispatcher the runtime pointer path uses; the two-argument
             /// form stays the single-click entry point.
             pub fn msgForPointerClick(self: Tree, target_id: ObjectId, phase: canvas.WidgetPointerPhase, click_count: u8) ?Msg {
-                if (phase == .up and click_count >= 2) {
+                if (phase == .up and click_count == 2) {
                     if (self.msgFor(target_id, .double_press)) |msg| return msg;
                 }
                 return self.msgForPointer(target_id, phase);
@@ -1377,6 +1381,14 @@ pub fn Ui(comptime Msg: type) type {
             /// entry widgets.
             pub fn msgForKeyboard(self: Tree, target_id: ObjectId, keyboard: canvas.WidgetKeyboardEvent) ?Msg {
                 const widget = self.findWidget(target_id) orelse return null;
+                // Tree focus navigation is selection without activation.
+                // `on_change` gives apps a distinct model message for that
+                // path (a file browser can move its tree cursor without
+                // opening a preview); rows that do not bind it retain the
+                // original selection-follows-focus `on_press` behavior.
+                if (widget.semantics.role == .treeitem and keyboard.focus_moved) {
+                    if (self.msgFor(target_id, .change)) |msg| return msg;
+                }
                 // A list row prefers a bound submit handler on plain
                 // Enter: Enter is the row's PRIMARY action (open the
                 // record, play the track — the desktop list convention),
@@ -1410,7 +1422,9 @@ pub fn Ui(comptime Msg: type) type {
                         // bytes that the new-input sanitizer would strip.
                         if (self.msgForTextEdit(target_id, stamped)) |msg| return msg;
                     } else {
-                        const locally_derived = canvas.widgetKeyboardNewlineTextEditEvent(widget.kind, keyboard) orelse keyboard.textEditEvent();
+                        const locally_derived = canvas.widgetCodeTabTextEditEvent(widget, keyboard) orelse
+                            canvas.widgetKeyboardNewlineTextEditEvent(widget.kind, keyboard) orelse
+                            keyboard.textEditEvent();
                         if (locally_derived) |text_edit| {
                             // Direct Tree consumers still sanitize locally:
                             // these bytes have not crossed the runtime seam.
@@ -1865,11 +1879,12 @@ pub fn Ui(comptime Msg: type) type {
         /// Disclosure-tree container: descendant rows carrying
         /// `role = .treeitem` (at any nesting depth) form one roving
         /// keyboard focus set with the ARIA tree keymap — Up/Down walk
-        /// visible rows (selection follows focus through each row's
-        /// `on_press`), Left collapses or moves to the parent row,
+        /// visible rows (selection follows focus through `on_change` when
+        /// bound, else `on_press`), Left collapses or moves to the parent row,
         /// Right expands or moves to the first child row, Home/End jump
-        /// to the edges. Expansion is model-owned: expandable rows set
-        /// `expanded` and bind `on_toggle`.
+        /// to the edges. Flat loop-rendered rows set `tree_level`; nested
+        /// rows derive the same hierarchy structurally. Expansion is
+        /// model-owned: expandable rows set `expanded` and bind `on_toggle`.
         pub fn tree(self: *Self, options: ElementOptions, children: anytype) Node {
             return self.el(.tree, options, children);
         }
@@ -2297,6 +2312,12 @@ pub fn Ui(comptime Msg: type) type {
             key: ?UiKey = null,
             global_key: ?UiKey = null,
             language: code_model.Language = .plain,
+            /// Opt into the engine's multiline editor behavior while
+            /// retaining code highlighting. Read-only is the default.
+            editable: bool = false,
+            /// Receives each edit when `editable` is true. The source is
+            /// controlled in exactly the same way as a textarea value.
+            on_input: ?InputMsgFn = null,
             /// Prefix each logical source line with a muted, monospace
             /// number. Off by default.
             line_numbers: bool = false,
@@ -2304,19 +2325,74 @@ pub fn Ui(comptime Msg: type) type {
             /// intact inside one horizontal scroll region.
             wrap: bool = true,
             width: f32 = 0,
-            /// Definite surface height. Overflow scrolls vertically;
-            /// no-wrap surfaces scroll on both axes.
+            /// Definite code-region height. Overflow scrolls vertically;
+            /// no-wrap regions scroll on both axes.
             height: f32 = 0,
             min_width: f32 = 0,
             grow: f32 = 0,
             semantics: canvas.WidgetSemantics = .{},
         };
 
-        /// A themed source-code surface with bounded syntax highlighting.
+        /// Bare source-code content with bounded, themed syntax highlighting.
+        /// The component owns layout, clipping, and scrolling, but deliberately
+        /// supplies no background, border, radius, shadow, or padding. Wrap it
+        /// in a panel or card when those presentation choices are wanted.
         /// Markdown fences lower through this same component.
         pub fn code(self: *Self, options: CodeOptions, source: []const u8) Node {
-            const line_count = codeLineCount(source);
-            const numbered = options.line_numbers and line_count <= max_code_lines;
+            const line_count = codeLineCount(source, options.editable);
+            const terminal_editor_line = options.editable and source.len > 0 and source[source.len - 1] == '\n';
+            const numbered = options.line_numbers and line_count - @intFromBool(terminal_editor_line) <=
+                (if (options.editable) max_editable_code_lines else max_code_lines);
+            if (options.editable) {
+                const retained = if (options.wrap) blk: {
+                    // Wrapped editor geometry still uses the bounded span
+                    // paragraph path; no-wrap editors use the scalable
+                    // viewport tokenizer below.
+                    var state: code_model.HighlightState = .{};
+                    break :blk self.codeParagraphWithState(
+                        source,
+                        options.language,
+                        true,
+                        options.grow,
+                        &state,
+                        null,
+                    );
+                } else blk: {
+                    const source_span = [_]canvas.TextSpan{.{
+                        .text = source,
+                        .monospace = true,
+                        .color = .syntax_plain,
+                    }};
+                    break :blk self.paragraph(
+                        .{ .wrap = false, .grow = options.grow },
+                        &source_span,
+                    );
+                };
+                var editor = self.el(.textarea, .{
+                    .key = options.key,
+                    .global_key = options.global_key,
+                    .width = options.width,
+                    .height = options.height,
+                    .min_width = options.min_width,
+                    .grow = options.grow,
+                    .semantics = options.semantics,
+                    .on_input = options.on_input,
+                }, .{});
+                // Retain the exact source once. Paint tokenizes visible
+                // logical lines with `code_language`, keeping syntax
+                // highlighting independent of document length.
+                editor.widget.text = retained.widget.text;
+                editor.widget.spans = retained.widget.spans;
+                editor.widget.text_no_wrap = !options.wrap;
+                editor.widget.code_line_number_digits = if (numbered)
+                    @intCast(decimalDigits(line_count))
+                else
+                    0;
+                editor.widget.code_editor = true;
+                editor.widget.code_language = options.language;
+                editor.widget.layout.clip_content = true;
+                return editor;
+            }
             const content = if (numbered)
                 self.numberedCodeParagraph(source, options.language, options.wrap, line_count)
             else
@@ -2347,19 +2423,17 @@ pub fn Ui(comptime Msg: type) type {
                     .grow = 1,
                 }, .{track});
             };
-            var surface = self.el(.panel, .{
+            var root = self.el(.column, .{
                 .key = options.key,
                 .global_key = options.global_key,
                 .width = options.width,
                 .height = options.height,
                 .min_width = options.min_width,
                 .grow = options.grow,
-                .padding = 12,
-                .style_tokens = .{ .background = .surface_subtle },
                 .semantics = options.semantics,
             }, .{body});
-            surface.widget.layout.clip_content = true;
-            return surface;
+            root.widget.layout.clip_content = true;
+            return root;
         }
 
         /// Keep numbered source in one selectable paragraph. The renderer
@@ -2492,6 +2566,10 @@ pub fn Ui(comptime Msg: type) type {
         /// Upper bound for formatting renderer-owned logical-line markers.
         /// Sources above it keep every source byte and omit the gutter.
         pub const max_code_lines: usize = 128;
+        /// Editable code paints only its viewport, so its line-number gutter
+        /// can scale far beyond the bounded paragraph layout used by
+        /// read-only snippets.
+        pub const max_editable_code_lines: usize = 10_000;
         pub const max_code_spans_per_surface: usize = 512;
 
         const CodeSpanBudget = struct {
@@ -2566,10 +2644,10 @@ pub fn Ui(comptime Msg: type) type {
         const max_code_logical_lines_per_paragraph: usize =
             canvas.text_spans.max_text_span_lines_per_paragraph;
 
-        fn codeLineCount(source: []const u8) usize {
+        fn codeLineCount(source: []const u8, include_terminal_line: bool) usize {
             if (source.len == 0) return 1;
             return std.mem.count(u8, source, "\n") +
-                @intFromBool(source[source.len - 1] != '\n');
+                @intFromBool(include_terminal_line or source[source.len - 1] != '\n');
         }
 
         fn decimalDigits(value: usize) usize {
@@ -3520,6 +3598,7 @@ pub fn Ui(comptime Msg: type) type {
                 .image_id = options.image,
                 .value = options.value,
                 .value_x = options.value_x,
+                .tree_level = options.tree_level,
                 .terminal = .{ .pty = options.pty, .scrollback = options.scrollback },
                 .scroll_axes = options.axis,
                 .variant = options.variant,

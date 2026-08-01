@@ -18,6 +18,7 @@ pub const Language = enum {
     javascript,
     typescript,
     json,
+    yaml,
     shell,
     python,
     rust,
@@ -26,6 +27,9 @@ pub const Language = enum {
     html,
     css,
     sql,
+    jsx,
+    tsx,
+    markdown,
 };
 
 /// Lexer state carried between bounded source chunks by `Ui.code`.
@@ -45,7 +49,14 @@ pub const HighlightState = struct {
     /// of ending it.
     html_tag_context_bases: [max_html_tag_contexts]usize = [_]usize{0} ** max_html_tag_contexts,
     html_tag_context_expect_names: [max_html_tag_contexts]bool = [_]bool{false} ** max_html_tag_contexts,
+    html_tag_context_opened_elements: [max_html_tag_contexts]bool = [_]bool{false} ** max_html_tag_contexts,
     html_tag_context_len: usize = 0,
+    /// Expression depth at which each currently open element began.
+    /// A closing tag is structural at that same depth even when ordinary
+    /// JSX text immediately before it ends in an identifier.
+    html_element_expression_bases: [max_html_tag_contexts]usize = [_]usize{0} ** max_html_tag_contexts,
+    html_element_len: usize = 0,
+    html_tag_opened_element: bool = false,
     /// Last non-whitespace source byte from the preceding presentation
     /// chunk. JSX comparison/tag disambiguation needs its left context even
     /// when a bounded paragraph happens to split immediately before `<`.
@@ -55,6 +66,10 @@ pub const HighlightState = struct {
     line_comment: bool = false,
     preprocessor_line: bool = false,
     string_quote: ?u8 = null,
+    markdown_line_start: bool = true,
+    markdown_fence_byte: u8 = 0,
+    markdown_fence_len: u8 = 0,
+    markdown_inline_code_len: u8 = 0,
 };
 
 fn pushHtmlTagContext(state: *HighlightState) void {
@@ -62,6 +77,7 @@ fn pushHtmlTagContext(state: *HighlightState) void {
     const index = state.html_tag_context_len;
     state.html_tag_context_bases[index] = state.html_tag_expression_base;
     state.html_tag_context_expect_names[index] = state.html_expect_tag_name;
+    state.html_tag_context_opened_elements[index] = state.html_tag_opened_element;
     state.html_tag_context_len += 1;
 }
 
@@ -72,6 +88,7 @@ fn restoreHtmlTagContext(state: *HighlightState) bool {
     state.html_in_tag = true;
     state.html_tag_expression_base = state.html_tag_context_bases[index];
     state.html_expect_tag_name = state.html_tag_context_expect_names[index];
+    state.html_tag_opened_element = state.html_tag_context_opened_elements[index];
     return true;
 }
 
@@ -80,10 +97,14 @@ fn restoreHtmlTagContext(state: *HighlightState) bool {
 pub fn languageFromName(name_raw: []const u8) Language {
     const name = std.mem.trim(u8, name_raw, " \t\r\n");
     if (std.ascii.eqlIgnoreCase(name, "zig")) return .zig;
-    if (std.ascii.eqlIgnoreCase(name, "jsx") or std.ascii.eqlIgnoreCase(name, "tsx")) return .html;
-    if (std.ascii.eqlIgnoreCase(name, "js") or std.ascii.eqlIgnoreCase(name, "javascript")) return .javascript;
+    if (std.ascii.eqlIgnoreCase(name, "jsx")) return .jsx;
+    if (std.ascii.eqlIgnoreCase(name, "tsx")) return .tsx;
+    if (std.ascii.eqlIgnoreCase(name, "js") or
+        std.ascii.eqlIgnoreCase(name, "mjs") or
+        std.ascii.eqlIgnoreCase(name, "javascript")) return .javascript;
     if (std.ascii.eqlIgnoreCase(name, "ts") or std.ascii.eqlIgnoreCase(name, "typescript")) return .typescript;
     if (std.ascii.eqlIgnoreCase(name, "json") or std.ascii.eqlIgnoreCase(name, "jsonc")) return .json;
+    if (std.ascii.eqlIgnoreCase(name, "yaml") or std.ascii.eqlIgnoreCase(name, "yml")) return .yaml;
     if (std.ascii.eqlIgnoreCase(name, "sh") or std.ascii.eqlIgnoreCase(name, "bash") or std.ascii.eqlIgnoreCase(name, "zsh") or std.ascii.eqlIgnoreCase(name, "shell")) return .shell;
     if (std.ascii.eqlIgnoreCase(name, "py") or std.ascii.eqlIgnoreCase(name, "python")) return .python;
     if (std.ascii.eqlIgnoreCase(name, "rs") or std.ascii.eqlIgnoreCase(name, "rust")) return .rust;
@@ -99,6 +120,7 @@ pub fn languageFromName(name_raw: []const u8) Language {
     if (std.ascii.eqlIgnoreCase(name, "html") or std.ascii.eqlIgnoreCase(name, "xml") or std.ascii.eqlIgnoreCase(name, "svg")) return .html;
     if (std.ascii.eqlIgnoreCase(name, "css") or std.ascii.eqlIgnoreCase(name, "scss") or std.ascii.eqlIgnoreCase(name, "less")) return .css;
     if (std.ascii.eqlIgnoreCase(name, "sql")) return .sql;
+    if (std.ascii.eqlIgnoreCase(name, "md") or std.ascii.eqlIgnoreCase(name, "markdown")) return .markdown;
     return .plain;
 }
 
@@ -166,14 +188,16 @@ fn wordColor(language: Language, word: []const u8) ?text_spans.TextSpanColor {
     if (word.len > 0 and word[0] == '@') return .syntax_function;
     if (language == .zig) return zig_words.get(word);
     if (language == .python and wordInList(word, "True False None", false)) return .syntax_literal;
+    if (language == .yaml and wordInList(word, "true false null yes no on off", true)) return .syntax_literal;
     if (wordInList(word, "true false null nil none undefined this self super", language == .sql)) return .syntax_literal;
 
     const keywords = switch (language) {
         .plain => return null,
         .zig => unreachable,
-        .javascript => "async await break case catch class const continue debugger default delete do else export extends finally for from function get if import in instanceof let new of return set static switch throw try typeof var void while with yield",
-        .typescript => "abstract any as asserts async await bigint boolean break case catch class const constructor continue declare default delete do else enum export extends finally for from function get if implements import in infer interface instanceof is keyof let module namespace never new number object of override private protected public readonly require return satisfies set static string super switch symbol this throw try type typeof undefined unique unknown var void while with yield",
+        .javascript, .jsx => "async await break case catch class const continue debugger default delete do else export extends finally for from function get if import in instanceof let new of return set static switch throw try typeof var void while with yield",
+        .typescript, .tsx => "abstract any as asserts async await bigint boolean break case catch class const constructor continue declare default delete do else enum export extends finally for from function get if implements import in infer interface instanceof is keyof let module namespace never new number object of override private protected public readonly require return satisfies set static string super switch symbol this throw try type typeof undefined unique unknown var void while with yield",
         .json => "",
+        .yaml => "",
         .shell => "case coproc do done elif else esac fi for function if in select then time until while",
         .python => "and as assert async await break case class continue def del elif else except finally for from global if import in is lambda match nonlocal not or pass raise return try while with yield",
         .rust => "as async await break const continue crate dyn else enum extern fn for if impl in let loop match mod move mut pub ref return self Self static struct super trait type union unsafe use where while",
@@ -182,6 +206,7 @@ fn wordColor(language: Language, word: []const u8) ?text_spans.TextSpanColor {
         .html => "",
         .css => "and important inherit initial none not only or revert unset",
         .sql => "add all alter and any as asc begin between by case check column commit constraint create cross database default delete desc distinct drop else end exists foreign from full grant group having in index inner insert intersect into is join key left like limit not null on or order outer primary references right rollback row select set table then union unique update values view when where with",
+        .markdown => "",
     };
     if (wordInList(word, keywords, language == .sql)) return .syntax_keyword;
 
@@ -189,7 +214,7 @@ fn wordColor(language: Language, word: []const u8) ?text_spans.TextSpanColor {
         .rust => "bool char str String Vec Option Result Box i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize f32 f64",
         .c_like => "bool boolean byte char decimal double float int long object sbyte short string uint ulong ushort void",
         .go => "any bool byte comparable complex64 complex128 error float32 float64 int int8 int16 int32 int64 rune string uint uint8 uint16 uint32 uint64 uintptr",
-        .javascript, .typescript => "Array BigInt Boolean Date Error Map Number Object Promise RegExp Set String Symbol",
+        .javascript, .typescript, .jsx, .tsx => "Array BigInt Boolean Date Error Map Number Object Promise RegExp Set String Symbol",
         .python => "bool bytes dict float int list object set str tuple",
         else => "",
     };
@@ -202,10 +227,10 @@ fn identifierStructuralColor(language: Language, source: []const u8, end: usize)
     while (cursor < source.len and (source[cursor] == ' ' or source[cursor] == '\t')) cursor += 1;
     if (cursor >= source.len or source[cursor] == '\n') return null;
     if (source[cursor] == '(' and language != .plain and language != .json) return .syntax_function;
-    if (source[cursor] == ':' and switch (language) {
-        .javascript, .typescript, .css => true,
-        else => false,
-    }) return .syntax_property;
+    // JavaScript/TypeScript object keys and typed bindings use the same
+    // identifier ink as variables. CSS declarations retain the dedicated
+    // property role.
+    if (source[cursor] == ':' and language == .css) return .syntax_property;
     if (source[cursor] == '{' and language == .css) return .syntax_literal;
     return null;
 }
@@ -216,6 +241,92 @@ fn identifierStart(byte: u8) bool {
 
 fn identifierContinue(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '@' or byte == '$';
+}
+
+fn yamlMappingKeyEnd(source: []const u8, start: usize) ?usize {
+    if (start >= source.len) return null;
+    // Let the sequence/explicit-key indicator stand on its own; the key
+    // beginning after its whitespace is considered from the next token.
+    if ((source[start] == '-' or source[start] == '?') and
+        start + 1 < source.len and
+        (source[start + 1] == ' ' or source[start + 1] == '\t'))
+    {
+        return null;
+    }
+
+    var before = start;
+    while (before > 0 and (source[before - 1] == ' ' or source[before - 1] == '\t')) before -= 1;
+    if (before > 0) {
+        switch (source[before - 1]) {
+            '\n', '\r', '{', '[', ',', '-', '?' => {},
+            else => return null,
+        }
+    }
+
+    var quote: ?u8 = null;
+    var cursor = start;
+    while (cursor < source.len) {
+        const byte = source[cursor];
+        if (quote) |active_quote| {
+            if (active_quote == '"' and byte == '\\' and cursor + 1 < source.len) {
+                cursor += 2;
+                continue;
+            }
+            if (byte == active_quote) {
+                // YAML single-quoted strings escape a quote by doubling it.
+                if (active_quote == '\'' and cursor + 1 < source.len and source[cursor + 1] == '\'') {
+                    cursor += 2;
+                    continue;
+                }
+                quote = null;
+            }
+            cursor += 1;
+            continue;
+        }
+
+        if (byte == '"' or byte == '\'') {
+            quote = byte;
+            cursor += 1;
+            continue;
+        }
+        if (byte == ':') {
+            const separates_value = cursor + 1 == source.len or switch (source[cursor + 1]) {
+                ' ', '\t', '\r', '\n', ',', '}', ']' => true,
+                else => false,
+            };
+            if (!separates_value) {
+                cursor += 1;
+                continue;
+            }
+            var end = cursor;
+            while (end > start and (source[end - 1] == ' ' or source[end - 1] == '\t')) end -= 1;
+            return if (end > start) end else null;
+        }
+        if (byte == '\n' or byte == '\r' or byte == ',' or byte == '}' or byte == ']') return null;
+        cursor += 1;
+    }
+    return null;
+}
+
+fn yamlSymbolEnd(source: []const u8, start: usize) usize {
+    var cursor = start + 1;
+    while (cursor < source.len) : (cursor += 1) {
+        switch (source[cursor]) {
+            ' ', '\t', '\r', '\n', ',', '[', ']', '{', '}' => break,
+            else => {},
+        }
+    }
+    return cursor;
+}
+
+fn yamlDocumentMarkerLength(rest: []const u8) usize {
+    if (rest.len < 3) return 0;
+    if (!std.mem.startsWith(u8, rest, "---") and !std.mem.startsWith(u8, rest, "...")) return 0;
+    if (rest.len == 3) return 3;
+    return switch (rest[3]) {
+        ' ', '\t', '\r', '\n', '#' => 3,
+        else => 0,
+    };
 }
 
 fn htmlTagOpenerByte(byte: u8) bool {
@@ -229,19 +340,41 @@ fn htmlPreviousAllowsTag(byte: u8) bool {
     };
 }
 
+fn isHtmlFamily(language: Language) bool {
+    return language == .html or language == .jsx or language == .tsx;
+}
+
+fn embeddedScriptLanguage(language: Language) Language {
+    return switch (language) {
+        .jsx => .javascript,
+        .html, .tsx => .typescript,
+        else => language,
+    };
+}
+
 /// A `<` in HTML-family source is structural only when it can begin a tag.
 /// Inside a JSX expression, the preceding token must also leave room for an
 /// expression operand; `count < limit` is relational, while
 /// `ok && <Badge />` starts nested JSX.
-fn htmlLessThanStartsTag(source: []const u8, index: usize, state: HighlightState) bool {
+fn htmlLessThanStartsTag(source: []const u8, index: usize, language: Language, state: HighlightState) bool {
     if (index + 1 >= source.len or !htmlTagOpenerByte(source[index + 1])) return false;
-    if (state.html_expression_depth == 0) return true;
+    if (language == .html and state.html_expression_depth == 0) return true;
+    if (!state.html_in_tag and state.html_element_len > 0 and
+        state.html_expression_depth == state.html_element_expression_bases[state.html_element_len - 1])
+    {
+        return true;
+    }
 
     var cursor = index;
     while (cursor > 0) {
         cursor -= 1;
         const byte = source[cursor];
         if (byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n') continue;
+        if (identifierContinue(byte)) {
+            const end = cursor + 1;
+            while (cursor > 0 and identifierContinue(source[cursor - 1])) cursor -= 1;
+            return wordInList(source[cursor..end], "return throw yield", false);
+        }
         return htmlPreviousAllowsTag(byte);
     }
     return htmlPreviousAllowsTag(state.html_previous_significant);
@@ -260,13 +393,13 @@ fn updateHtmlPreviousSignificant(state: *HighlightState, source: []const u8) voi
 
 fn stringQuote(language: Language, byte: u8) bool {
     return switch (language) {
-        .plain, .html => false,
+        .plain, .html, .markdown => false,
         .json => byte == '"',
         // A Rust apostrophe begins a character only when a closing quote
         // follows one scalar or escape; otherwise it introduces a lifetime
         // (`'a`, `'static`) and must not open multiline string state.
         .rust => byte == '"',
-        .shell, .javascript, .typescript, .go => byte == '"' or byte == '\'' or byte == '`',
+        .shell, .javascript, .typescript, .jsx, .tsx, .go => byte == '"' or byte == '\'' or byte == '`',
         else => byte == '"' or byte == '\'',
     };
 }
@@ -318,19 +451,27 @@ fn backslashEscapesQuote(language: Language, state: HighlightState, quote: u8) b
         // Plain HTML attributes do not use JavaScript escapes for either
         // quote style, but strings inside JSX expressions do.
         .html => state.html_expression_depth > 0,
+        // JSX attribute text follows HTML quote rules; JavaScript strings
+        // at top level or inside an attribute expression use escapes.
+        .jsx, .tsx => !state.html_in_tag or state.html_expression_depth > state.html_tag_expression_base,
         // Shell single quotes are literal. SQL quotes are escaped by
         // doubling them, never with a backslash.
         .shell => quote != '\'',
+        .yaml => quote == '"',
         .sql => false,
         else => true,
     };
 }
 
-fn lineCommentPrefix(language: Language, rest: []const u8) usize {
+fn lineCommentPrefix(language: Language, source: []const u8, index: usize) usize {
+    const rest = source[index..];
     if (rest.len == 0) return 0;
     return switch (language) {
-        .zig, .javascript, .typescript, .rust, .c_like, .go => if (std.mem.startsWith(u8, rest, "//")) 2 else 0,
+        .zig, .javascript, .typescript, .jsx, .tsx, .rust, .c_like, .go => if (std.mem.startsWith(u8, rest, "//")) 2 else 0,
         .shell, .python => if (rest[0] == '#') 1 else 0,
+        .yaml => if (rest[0] == '#' and
+            (index == 0 or source[index - 1] == ' ' or source[index - 1] == '\t' or
+                source[index - 1] == '\r' or source[index - 1] == '\n')) 1 else 0,
         .sql => if (std.mem.startsWith(u8, rest, "--")) 2 else 0,
         else => 0,
     };
@@ -338,7 +479,7 @@ fn lineCommentPrefix(language: Language, rest: []const u8) usize {
 
 fn hasBlockComments(language: Language) bool {
     return switch (language) {
-        .zig, .javascript, .typescript, .rust, .c_like, .go, .css, .sql => true,
+        .zig, .javascript, .typescript, .jsx, .tsx, .rust, .c_like, .go, .css, .sql => true,
         else => false,
     };
 }
@@ -371,6 +512,243 @@ fn appendSpan(
     return true;
 }
 
+fn appendMarkdownSpan(
+    storage: *[text_spans.max_text_spans_per_paragraph]TextSpan,
+    len: *usize,
+    source: []const u8,
+    start: usize,
+    end: usize,
+    color: text_spans.TextSpanColor,
+    styling_full: *bool,
+) void {
+    if (styling_full.*) return;
+    if (!appendSpan(storage, len, source, start, end, color)) styling_full.* = true;
+}
+
+fn markdownDelimiterRun(source: []const u8, start: usize, byte: u8) usize {
+    var end = start;
+    while (end < source.len and source[end] == byte) end += 1;
+    return end - start;
+}
+
+fn markdownFenceLine(
+    source: []const u8,
+    start: usize,
+    state: HighlightState,
+) ?struct { marker_start: usize, marker_end: usize, line_end: usize, closes: bool } {
+    var marker_start = start;
+    var indent: usize = 0;
+    while (marker_start < source.len and indent < 3 and source[marker_start] == ' ') : (indent += 1) marker_start += 1;
+    if (marker_start >= source.len) return null;
+    const byte = source[marker_start];
+    if (byte != '`' and byte != '~') return null;
+    const run = markdownDelimiterRun(source, marker_start, byte);
+    if (run < 3) return null;
+
+    const line_break = std.mem.indexOfScalarPos(u8, source, marker_start + run, '\n');
+    const line_end = if (line_break) |newline| newline + 1 else source.len;
+    if (state.markdown_fence_byte == 0) {
+        return .{ .marker_start = marker_start, .marker_end = marker_start + run, .line_end = line_end, .closes = false };
+    }
+    if (byte != state.markdown_fence_byte or run < state.markdown_fence_len) return null;
+    const suffix_end = if (line_break) |newline| newline else source.len;
+    if (std.mem.trim(u8, source[marker_start + run .. suffix_end], " \t\r").len != 0) return null;
+    return .{ .marker_start = marker_start, .marker_end = marker_start + run, .line_end = line_end, .closes = true };
+}
+
+fn markdownListMarkerEnd(source: []const u8, start: usize) ?usize {
+    if (start >= source.len) return null;
+    if ((source[start] == '-' or source[start] == '+' or source[start] == '*') and
+        start + 1 < source.len and (source[start + 1] == ' ' or source[start + 1] == '\t'))
+    {
+        return start + 1;
+    }
+    if (!std.ascii.isDigit(source[start])) return null;
+    var end = start + 1;
+    while (end < source.len and std.ascii.isDigit(source[end])) end += 1;
+    if (end >= source.len or (source[end] != '.' and source[end] != ')')) return null;
+    if (end + 1 >= source.len or (source[end + 1] != ' ' and source[end + 1] != '\t')) return null;
+    return end + 1;
+}
+
+fn markdownInlineCodeEnd(source: []const u8, start: usize, delimiter_len: usize) ?usize {
+    var cursor = start;
+    while (cursor < source.len) {
+        if (source[cursor] == '`') {
+            const run = markdownDelimiterRun(source, cursor, '`');
+            if (run == delimiter_len) return cursor + run;
+            cursor += run;
+            continue;
+        }
+        cursor += 1;
+    }
+    return null;
+}
+
+fn highlightMarkdownWithState(
+    source: []const u8,
+    storage: *[text_spans.max_text_spans_per_paragraph]TextSpan,
+    state: *HighlightState,
+) []const TextSpan {
+    var len: usize = 0;
+    var styling_full = false;
+    var index: usize = 0;
+    while (index < source.len) {
+        if (state.markdown_line_start) {
+            if (markdownFenceLine(source, index, state.*)) |fence| {
+                appendMarkdownSpan(storage, &len, source, index, fence.marker_start, .syntax_plain, &styling_full);
+                appendMarkdownSpan(storage, &len, source, fence.marker_start, fence.marker_end, .syntax_keyword, &styling_full);
+                appendMarkdownSpan(storage, &len, source, fence.marker_end, fence.line_end, if (fence.closes) .syntax_plain else .syntax_constant, &styling_full);
+                if (fence.closes) {
+                    state.markdown_fence_byte = 0;
+                    state.markdown_fence_len = 0;
+                } else {
+                    state.markdown_fence_byte = source[fence.marker_start];
+                    state.markdown_fence_len = @intCast(@min(fence.marker_end - fence.marker_start, std.math.maxInt(u8)));
+                }
+                state.markdown_line_start = fence.line_end > fence.marker_end and source[fence.line_end - 1] == '\n';
+                index = fence.line_end;
+                continue;
+            }
+            if (state.markdown_fence_byte != 0) {
+                const newline = std.mem.indexOfScalarPos(u8, source, index, '\n');
+                const end = if (newline) |line_break| line_break + 1 else source.len;
+                appendMarkdownSpan(storage, &len, source, index, end, .syntax_literal, &styling_full);
+                state.markdown_line_start = newline != null;
+                index = end;
+                continue;
+            }
+
+            var content = index;
+            var indent: usize = 0;
+            while (content < source.len and indent < 3 and source[content] == ' ') : (indent += 1) content += 1;
+            appendMarkdownSpan(storage, &len, source, index, content, .syntax_plain, &styling_full);
+            if (content < source.len and source[content] == '#') {
+                const run = markdownDelimiterRun(source, content, '#');
+                if (run <= 6 and content + run < source.len and (source[content + run] == ' ' or source[content + run] == '\t')) {
+                    appendMarkdownSpan(storage, &len, source, content, content + run, .syntax_keyword, &styling_full);
+                    index = content + run;
+                    state.markdown_line_start = false;
+                    continue;
+                }
+            }
+            if (content < source.len and source[content] == '>') {
+                appendMarkdownSpan(storage, &len, source, content, content + 1, .syntax_keyword, &styling_full);
+                index = content + 1;
+                state.markdown_line_start = false;
+                continue;
+            }
+            if (markdownListMarkerEnd(source, content)) |marker_end| {
+                appendMarkdownSpan(storage, &len, source, content, marker_end, .syntax_keyword, &styling_full);
+                index = marker_end;
+                state.markdown_line_start = false;
+                continue;
+            }
+            index = content;
+            state.markdown_line_start = false;
+            if (index >= source.len) break;
+        }
+
+        if (source[index] == '\n') {
+            appendMarkdownSpan(storage, &len, source, index, index + 1, .syntax_plain, &styling_full);
+            index += 1;
+            state.markdown_line_start = true;
+            continue;
+        }
+        if (state.html_comment) {
+            const closing = std.mem.indexOfPos(u8, source, index, "-->");
+            const end = if (closing) |close| close + 3 else source.len;
+            appendMarkdownSpan(storage, &len, source, index, end, .syntax_comment, &styling_full);
+            state.html_comment = closing == null;
+            index = end;
+            continue;
+        }
+        if (std.mem.startsWith(u8, source[index..], "<!--")) {
+            const closing = std.mem.indexOfPos(u8, source, index + 4, "-->");
+            const end = if (closing) |close| close + 3 else source.len;
+            appendMarkdownSpan(storage, &len, source, index, end, .syntax_comment, &styling_full);
+            state.html_comment = closing == null;
+            index = end;
+            continue;
+        }
+        if (state.markdown_inline_code_len != 0) {
+            const delimiter_len = state.markdown_inline_code_len;
+            if (markdownInlineCodeEnd(source, index, delimiter_len)) |end| {
+                appendMarkdownSpan(storage, &len, source, index, end, .syntax_literal, &styling_full);
+                state.markdown_inline_code_len = 0;
+                index = end;
+            } else {
+                appendMarkdownSpan(storage, &len, source, index, source.len, .syntax_literal, &styling_full);
+                index = source.len;
+            }
+            continue;
+        }
+        if (source[index] == '`') {
+            const delimiter_len = markdownDelimiterRun(source, index, '`');
+            const content_start = index + delimiter_len;
+            if (markdownInlineCodeEnd(source, content_start, delimiter_len)) |end| {
+                appendMarkdownSpan(storage, &len, source, index, end, .syntax_literal, &styling_full);
+                state.markdown_inline_code_len = 0;
+                index = end;
+            } else {
+                appendMarkdownSpan(storage, &len, source, index, source.len, .syntax_literal, &styling_full);
+                state.markdown_inline_code_len = @intCast(@min(delimiter_len, std.math.maxInt(u8)));
+                index = source.len;
+            }
+            continue;
+        }
+        if (source[index] == '\\' and index + 1 < source.len) {
+            appendMarkdownSpan(storage, &len, source, index, index + 2, .syntax_constant, &styling_full);
+            index += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, source[index..], "![")) {
+            appendMarkdownSpan(storage, &len, source, index, index + 2, .syntax_keyword, &styling_full);
+            index += 2;
+            continue;
+        }
+        if (source[index] == '[' or source[index] == ']') {
+            appendMarkdownSpan(storage, &len, source, index, index + 1, .syntax_property, &styling_full);
+            index += 1;
+            continue;
+        }
+        if (source[index] == '(' and index > 0 and source[index - 1] == ']') {
+            const close = std.mem.indexOfScalarPos(u8, source, index + 1, ')');
+            const end = if (close) |value| value + 1 else source.len;
+            appendMarkdownSpan(storage, &len, source, index, end, .syntax_literal, &styling_full);
+            index = end;
+            continue;
+        }
+        if (source[index] == '<' and
+            (std.mem.startsWith(u8, source[index..], "<http://") or std.mem.startsWith(u8, source[index..], "<https://")))
+        {
+            const close = std.mem.indexOfScalarPos(u8, source, index + 1, '>');
+            const end = if (close) |value| value + 1 else source.len;
+            appendMarkdownSpan(storage, &len, source, index, end, .syntax_literal, &styling_full);
+            index = end;
+            continue;
+        }
+        if (source[index] == '*' or source[index] == '_' or source[index] == '~') {
+            const run = @min(markdownDelimiterRun(source, index, source[index]), 2);
+            appendMarkdownSpan(storage, &len, source, index, index + run, .syntax_keyword, &styling_full);
+            index += run;
+            continue;
+        }
+
+        const start = index;
+        while (index < source.len and
+            source[index] != '\n' and source[index] != '`' and source[index] != '\\' and
+            source[index] != '[' and source[index] != ']' and source[index] != '(' and
+            source[index] != '<' and source[index] != '*' and source[index] != '_' and source[index] != '~')
+        {
+            index += 1;
+        }
+        if (index == start) index += 1;
+        appendMarkdownSpan(storage, &len, source, start, index, .syntax_plain, &styling_full);
+    }
+    return storage[0..len];
+}
+
 /// Tokenize `source` into theme-colored monospace spans.
 pub fn highlight(
     source: []const u8,
@@ -395,6 +773,7 @@ pub fn highlightWithState(
         storage[0] = .{ .text = source, .monospace = true, .color = .syntax_plain };
         return storage[0..1];
     }
+    if (language == .markdown) return highlightMarkdownWithState(source, storage, state);
 
     var len: usize = 0;
     var styling_full = false;
@@ -471,7 +850,7 @@ pub fn highlightWithState(
                 state.block_comment = true;
             }
             color = .syntax_comment;
-        } else if (lineCommentPrefix(language, rest) != 0) {
+        } else if (lineCommentPrefix(language, source, index) != 0) {
             while (index < source.len and source[index] != '\n') index += 1;
             state.line_comment = index == source.len;
             color = .syntax_comment;
@@ -479,41 +858,74 @@ pub fn highlightWithState(
             while (index < source.len and source[index] != '\n') index += 1;
             state.preprocessor_line = index == source.len;
             color = .syntax_constant;
-        } else if (language == .html and
+        } else if (isHtmlFamily(language) and
             rest[0] == '<' and
-            htmlLessThanStartsTag(source, index, state.*))
+            htmlLessThanStartsTag(source, index, language, state.*))
         {
             index += 1;
-            if (index < source.len and source[index] == '/') index += 1;
+            const opener = if (index < source.len) source[index] else 0;
+            const closing = opener == '/';
+            if (closing) index += 1;
             pushHtmlTagContext(state);
             state.html_in_tag = true;
             state.html_expect_tag_name = true;
             state.html_tag_expression_base = state.html_expression_depth;
+            state.html_tag_opened_element = false;
+            if (closing) {
+                if (state.html_element_len > 0) state.html_element_len -= 1;
+            } else if ((identifierStart(opener) or opener == '>') and
+                state.html_element_len < state.html_element_expression_bases.len)
+            {
+                state.html_element_expression_bases[state.html_element_len] = state.html_expression_depth;
+                state.html_element_len += 1;
+                state.html_tag_opened_element = true;
+            }
             color = .syntax_plain;
-        } else if (language == .html and
+        } else if (isHtmlFamily(language) and
             state.html_in_tag and
             state.html_expression_depth == state.html_tag_expression_base and
             rest[0] == '>')
         {
+            if (state.html_tag_opened_element and index > 0 and source[index - 1] == '/' and state.html_element_len > 0) {
+                state.html_element_len -= 1;
+            }
             index += 1;
             if (!restoreHtmlTagContext(state)) {
                 state.html_in_tag = false;
                 state.html_expect_tag_name = false;
+                state.html_tag_opened_element = false;
             }
             color = .syntax_plain;
-        } else if (language == .html and rest[0] == '{') {
+        } else if (isHtmlFamily(language) and rest[0] == '{') {
             index += 1;
             state.html_expression_depth += 1;
             color = .syntax_plain;
-        } else if (language == .html and state.html_expression_depth > 0 and rest[0] == '}') {
+        } else if (isHtmlFamily(language) and state.html_expression_depth > 0 and rest[0] == '}') {
             index += 1;
             state.html_expression_depth -= 1;
             color = .syntax_plain;
         } else if (if (language == .rust) rustCharLiteralLength(rest) else null) |literal_len| {
             index += literal_len;
             color = .syntax_literal;
+        } else if (if (language == .yaml) yamlMappingKeyEnd(source, index) else null) |key_end| {
+            index = key_end;
+            color = .syntax_property;
+        } else if (language == .yaml and yamlDocumentMarkerLength(rest) != 0) {
+            index += yamlDocumentMarkerLength(rest);
+            color = .syntax_keyword;
+        } else if (language == .yaml and
+            (rest[0] == '&' or rest[0] == '*' or rest[0] == '!' or rest[0] == '%'))
+        {
+            index = yamlSymbolEnd(source, index);
+            color = .syntax_constant;
+        } else if (language == .yaml and rest[0] == '~') {
+            index += 1;
+            color = .syntax_literal;
+        } else if (language == .yaml and (rest[0] == '|' or rest[0] == '>')) {
+            index += 1;
+            color = .syntax_keyword;
         } else if (stringQuote(language, rest[0]) or
-            (language == .html and
+            (isHtmlFamily(language) and
                 (state.html_in_tag or state.html_expression_depth > 0) and
                 (rest[0] == '"' or rest[0] == '\'' or rest[0] == '`')))
         {
@@ -549,24 +961,30 @@ pub fn highlightWithState(
             index += 1;
             while (index < source.len and
                 (identifierContinue(source[index]) or
-                    ((language == .html or language == .css) and source[index] == '-')))
+                    ((language == .css or
+                        (isHtmlFamily(language) and state.html_in_tag)) and
+                        source[index] == '-')))
             {
                 index += 1;
             }
-            if (language == .html and state.html_in_tag) {
+            if (isHtmlFamily(language) and state.html_in_tag) {
                 if (state.html_expect_tag_name) {
                     color = .syntax_literal;
                     state.html_expect_tag_name = false;
-                } else if (state.html_expression_depth == 0) {
+                } else if (state.html_expression_depth == state.html_tag_expression_base) {
                     color = .syntax_function;
                 } else {
-                    color = wordColor(.typescript, source[start..index]) orelse
-                        identifierStructuralColor(.typescript, source, index) orelse
+                    const script_language = embeddedScriptLanguage(language);
+                    color = wordColor(script_language, source[start..index]) orelse
+                        identifierStructuralColor(script_language, source, index) orelse
                         .syntax_plain;
                 }
-            } else if (language == .html and state.html_expression_depth > 0) {
-                color = wordColor(.typescript, source[start..index]) orelse
-                    identifierStructuralColor(.typescript, source, index) orelse
+            } else if (isHtmlFamily(language) and
+                (state.html_expression_depth > 0 or language == .jsx or language == .tsx))
+            {
+                const script_language = embeddedScriptLanguage(language);
+                color = wordColor(script_language, source[start..index]) orelse
+                    identifierStructuralColor(script_language, source, index) orelse
                     .syntax_plain;
             } else {
                 color = wordColor(language, source[start..index]) orelse
@@ -577,7 +995,7 @@ pub fn highlightWithState(
             index += 1;
         }
 
-        if (language == .html) updateHtmlPreviousSignificant(state, source[start..index]);
+        if (isHtmlFamily(language)) updateHtmlPreviousSignificant(state, source[start..index]);
 
         // The last span already covers the entire plain-syntax remainder once
         // capacity fills, but keep scanning it so state handed to the next

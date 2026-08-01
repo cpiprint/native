@@ -6,6 +6,7 @@ const token_model = @import("tokens.zig");
 const widget_model = @import("widgets.zig");
 const widget_access = @import("widget_access.zig");
 const widget_metrics = @import("widget_metrics.zig");
+const text_measure_cache = @import("text_measure_cache.zig");
 
 const FontId = @import("root.zig").FontId;
 const Builder = @import("commands.zig").Builder;
@@ -85,12 +86,12 @@ pub fn widgetTextInputTextNeedsPresentation(widget: Widget) bool {
 /// scroll measures) substitute into. Every entry point re-derives it,
 /// and within one widget's computation repeated derivations write
 /// identical bytes, so the aliasing is harmless. Sized to the runtime's
-/// per-view widget-text budget (65536). Nothing EMITTED may retain a
+/// per-view widget-text budget. Nothing EMITTED may retain a
 /// slice into it: render emitters persist presented bytes into the
 /// display-list builder via `persistWidgetTextInputPresentedText`, whose
 /// storage lives exactly as long as the emitted commands do.
 const WidgetTextPresentationScratch = struct {
-    slot: [65536]u8,
+    slot: [text_model.max_widget_text_bytes_per_view]u8,
 };
 const widget_text_presentation_scratch = @import("lazy_tls.zig").LazyTls(WidgetTextPresentationScratch);
 
@@ -111,6 +112,18 @@ fn presentedSingleLineText(text: []const u8) []const u8 {
         scratch.slot[index] = if (byte == '\n' or byte == '\r') ' ' else byte;
     }
     return scratch.slot[0..text.len];
+}
+
+test "single-line presentation rewrites values above the former 64 KiB ceiling" {
+    const input = try std.testing.allocator.alloc(u8, 65537);
+    defer std.testing.allocator.free(input);
+    @memset(input, 'a');
+    input[32768] = '\n';
+
+    const presented = widgetTextInputPresentedText(.{ .kind = .input, .text = input });
+    try std.testing.expectEqual(input.len, presented.len);
+    try std.testing.expectEqual(@as(u8, ' '), presented[32768]);
+    try std.testing.expect(std.mem.indexOfAny(u8, presented, "\r\n") == null);
 }
 
 /// Persist presented bytes into the display-list BUILDER so an emitted
@@ -178,12 +191,14 @@ fn widgetTextInputLineHeight(text_size: f32) f32 {
 }
 
 fn widgetTextInputWrap(widget: Widget, line_height: f32) TextWrap {
+    if (widget.code_editor) return if (widget.text_no_wrap) .none else .word;
     if (widget.kind == .textarea) return .word;
     if (widget.kind == .text_field and widget.frame.height >= line_height * 2.25) return .word;
     return .none;
 }
 
 fn widgetTextInputVerticalInset(widget: Widget, tokens: DesignTokens, text_size: f32, options: TextLayoutOptions) f32 {
+    if (widget.code_editor) return 0;
     if (options.wrap != .none) return widget_metrics.widgetControlInset(widget, tokens, tokens.spacing.sm);
     return @max(0, (widget.frame.height - widgetTextInputLineHeight(text_size)) * 0.5);
 }
@@ -205,7 +220,8 @@ const text_input_caret_reserve: f32 = 1;
 /// unscrolled field always has.
 fn widgetTextInputHorizontalScrollOffset(widget: Widget, tokens: DesignTokens, text_size: f32, text_inset: f32, options: TextLayoutOptions) f32 {
     if (options.wrap != .none) return 0;
-    return std.math.clamp(widget.value, 0, widgetTextInputMaxHorizontalScrollOffset(widget, tokens, text_size, text_inset, options));
+    const offset = if (widget.code_editor) widget.value_x else widget.value;
+    return std.math.clamp(offset, 0, widgetTextInputMaxHorizontalScrollOffset(widget, tokens, text_size, text_inset, options));
 }
 
 fn widgetTextInputMaxHorizontalScrollOffset(widget: Widget, tokens: DesignTokens, text_size: f32, text_inset: f32, options: TextLayoutOptions) f32 {
@@ -215,11 +231,24 @@ fn widgetTextInputMaxHorizontalScrollOffset(widget: Widget, tokens: DesignTokens
     // Measure the PRESENTED bytes — the ones the field lays out and
     // paints — so a value holding a line break scrolls by the same
     // single-line extent it draws.
-    const text_width = measureTextWidthForFont(options.measure, tokens.typography.font_id, widgetTextInputPresentedText(widget), text_size);
+    const font_id = widgetTextInputFontId(widget, tokens);
+    const text_width = if (widget.code_editor)
+        if (codeContentWidthCacheCurrent(widget, font_id, text_size))
+            widget.code_content_width
+        else
+            widestLogicalLineWidth(options.measure, font_id, widget.text, text_size)
+    else
+        measureTextWidthForFont(options.measure, font_id, widgetTextInputPresentedText(widget), text_size);
     return @max(0, text_width + text_input_caret_reserve - viewport.width);
 }
 
 pub fn widgetTextInputOrigin(widget: Widget, tokens: DesignTokens, text_size: f32, inset: f32, options: TextLayoutOptions) geometry.PointF {
+    if (widget.code_editor) {
+        return geometry.PointF.init(
+            widget.frame.x + inset - widgetTextInputHorizontalScrollOffset(widget, tokens, text_size, inset, options),
+            widget.frame.y + text_size - widgetTextInputScrollOffset(widget, tokens, text_size, inset, options),
+        );
+    }
     if (options.wrap != .none) {
         const scroll_offset = widgetTextInputScrollOffset(widget, tokens, text_size, inset, options);
         return geometry.PointF.init(
@@ -263,7 +292,20 @@ pub fn textInputContentExtentForWidget(widget: Widget, tokens: DesignTokens) f32
     const text_inset = widgetTextInputInset(widget, tokens);
     const options = widgetTextInputLayoutOptions(widget, tokens, text_size, text_inset);
     const line_height = widgetTextInputLineHeight(text_size);
-    return @as(f32, @floatFromInt(widgetTextInputLineCount(widget, tokens.typography.font_id, text_size, options))) * line_height;
+    return @as(f32, @floatFromInt(widgetTextInputLineCount(widget, widgetTextInputFontId(widget, tokens), text_size, options))) * line_height;
+}
+
+pub fn textInputContentWidthForWidget(widget: Widget, tokens: DesignTokens) f32 {
+    if (!widget_access.widgetTextInputKind(widget.kind)) return 0;
+    const text_size = widgetTextInputSize(widget, tokens);
+    const inset = widgetTextInputInset(widget, tokens);
+    const options = widgetTextInputLayoutOptions(widget, tokens, text_size, inset);
+    const viewport = widgetTextInputClipRect(widget, tokens, text_size, inset, options);
+    // Content and viewport share the source-text coordinate space. In a
+    // numbered editor the outer frame also contains the pinned gutter;
+    // counting that frame here while scrolling against `viewport.width`
+    // manufactures a gutter-wide range even when the longest line fits.
+    return viewport.width + widgetTextInputMaxHorizontalScrollOffset(widget, tokens, text_size, inset, options);
 }
 
 pub fn textInputMaxScrollOffsetForWidget(widget: Widget, tokens: DesignTokens) f32 {
@@ -323,7 +365,17 @@ pub fn textInputCaretVisibleScrollOffsetForWidget(widget: Widget, tokens: Design
     // selection rects measure with — the PRESENTED bytes (byte offsets
     // are interchangeable: the presentation substitutes 1:1).
     const caret_offset = snapTextOffset(widget.text, selection.focus);
-    const caret_x = measureTextWidthForFont(options.measure, tokens.typography.font_id, widgetTextInputPresentedText(widget)[0..caret_offset], text_size);
+    const caret_line_start = if (widget.code_editor)
+        (std.mem.lastIndexOfScalar(u8, widget.text[0..caret_offset], '\n') orelse 0) +
+            @as(usize, @intFromBool(std.mem.lastIndexOfScalar(u8, widget.text[0..caret_offset], '\n') != null))
+    else
+        0;
+    const caret_x = measureTextWidthForFont(
+        options.measure,
+        widgetTextInputFontId(widget, tokens),
+        widgetTextInputPresentedText(widget)[caret_line_start..caret_offset],
+        text_size,
+    );
     const margin = textInputCaretVisibleMargin(viewport.width);
     var next = clamped;
     const scrolled_in = caret_x + text_input_caret_reserve + margin - viewport.width;
@@ -358,7 +410,7 @@ pub fn widgetTextInputClipsText(widget: Widget, tokens: DesignTokens, text_size:
 
 fn widgetTextInputMaxScrollOffset(widget: Widget, tokens: DesignTokens, text_size: f32, text_inset: f32, options: TextLayoutOptions) f32 {
     const viewport = widgetTextInputClipRect(widget, tokens, text_size, text_inset, options);
-    return @max(0, textInputContentExtentForWidgetWithOptions(widget, tokens.typography.font_id, text_size, options) - viewport.height);
+    return @max(0, textInputContentExtentForWidgetWithOptions(widget, widgetTextInputFontId(widget, tokens), text_size, options) - viewport.height);
 }
 
 fn textInputContentExtentForWidgetWithOptions(widget: Widget, font_id: FontId, text_size: f32, options: TextLayoutOptions) f32 {
@@ -397,7 +449,7 @@ pub fn widgetTextInputDrawText(
     options: TextLayoutOptions,
 ) DrawText {
     return .{
-        .font_id = tokens.typography.font_id,
+        .font_id = widgetTextInputFontId(widget, tokens),
         .size = text_size,
         .origin = pixelSnapTextPoint(tokens, origin),
         .color = color,
@@ -412,6 +464,7 @@ pub fn widgetTextInputDrawText(
 }
 
 pub fn widgetTextInputInset(widget: Widget, tokens: DesignTokens) f32 {
+    if (widget.code_editor) return widget_metrics.widgetCodeLineNumberGutterWidth(widget, tokens);
     const text_size = widgetTextInputSize(widget, tokens);
     return switch (widget.kind) {
         .search_field, .combobox => widget_metrics.widgetControlInset(widget, tokens, tokens.spacing.md) + @max(widget_metrics.widgetSizedDensityValue(widget, tokens, 8), text_size - 2) + widget_metrics.widgetControlInset(widget, tokens, tokens.spacing.sm),
@@ -419,7 +472,111 @@ pub fn widgetTextInputInset(widget: Widget, tokens: DesignTokens) f32 {
     };
 }
 
+fn widgetTextInputFontId(widget: Widget, tokens: DesignTokens) FontId {
+    return if (widget.code_editor) tokens.typography.mono_font_id else tokens.typography.font_id;
+}
+
+fn codeContentWidthCacheCurrent(widget: Widget, font_id: FontId, text_size: f32) bool {
+    return widget.code_content_width_generation == text_measure_cache.textMeasureGeneration() and
+        widget.code_content_width_font_id == font_id and
+        widget.code_content_width_size_bits == @as(u32, @bitCast(text_size)) and
+        widget.code_content_width >= 0 and
+        std.math.isFinite(widget.code_content_width);
+}
+
+/// Populate the retained longest-line width once per source/font generation.
+/// Runtime reconciliation carries this cache across unchanged app rebuilds;
+/// edits invalidate it before caret scrolling recomputes the new document.
+pub fn cacheTextInputContentWidthForWidget(widget: *Widget, tokens: DesignTokens) void {
+    if (widget.kind != .textarea or !widget.code_editor or !widget.text_no_wrap) return;
+    const text_size = widgetTextInputSize(widget.*, tokens);
+    const font_id = widgetTextInputFontId(widget.*, tokens);
+    if (codeContentWidthCacheCurrent(widget.*, font_id, text_size)) return;
+    widget.code_content_width = widestLogicalLineWidth(tokens.text_measure, font_id, widget.text, text_size);
+    widget.code_content_width_generation = text_measure_cache.textMeasureGeneration();
+    widget.code_content_width_font_id = font_id;
+    widget.code_content_width_size_bits = @bitCast(text_size);
+}
+
+fn widestLogicalLineWidth(
+    measure: ?*const text_model.TextMeasureProvider,
+    font_id: FontId,
+    text: []const u8,
+    text_size: f32,
+) f32 {
+    if (measure) |provider| {
+        if (widestLogicalLineWidthBatched(provider, font_id, text, text_size)) |width| return width;
+    }
+
+    var widest: f32 = 0;
+    var start: usize = 0;
+    while (start <= text.len) {
+        const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
+        widest = @max(widest, measureTextWidthForFont(measure, font_id, text[start..end], text_size));
+        if (end == text.len) break;
+        start = end + 1;
+    }
+    return widest;
+}
+
+/// Measure many ordinary source lines in one provider round-trip. Chunks end
+/// at a newline so shaping never crosses a logical-line boundary. A single
+/// extraordinary line above the batched scratch bound takes one width call;
+/// the common 10,000-line document takes only a handful of batched calls.
+fn widestLogicalLineWidthBatched(
+    provider: *const text_model.TextMeasureProvider,
+    font_id: FontId,
+    text: []const u8,
+    text_size: f32,
+) ?f32 {
+    if (provider.measure_advances_fn == null) return null;
+    if (text.len == 0) return 0;
+
+    var widest: f32 = 0;
+    var chunk_start: usize = 0;
+    while (chunk_start < text.len) {
+        const limit_end = @min(
+            text.len,
+            chunk_start +| text_measure_cache.max_batched_advance_run_bytes,
+        );
+        var chunk_end = limit_end;
+        if (limit_end < text.len) {
+            const bounded = text[chunk_start..limit_end];
+            if (std.mem.lastIndexOfScalar(u8, bounded, '\n')) |newline| {
+                chunk_end = chunk_start + newline + 1;
+            } else {
+                const line_end = std.mem.indexOfScalarPos(u8, text, chunk_start, '\n') orelse text.len;
+                widest = @max(
+                    widest,
+                    measureTextWidthForFont(provider, font_id, text[chunk_start..line_end], text_size),
+                );
+                chunk_start = if (line_end < text.len) line_end + 1 else line_end;
+                continue;
+            }
+        }
+
+        const chunk = text[chunk_start..chunk_end];
+        const advances = text_measure_cache.textRunAdvances(provider, font_id, text_size, chunk) orelse return null;
+        var line_start: usize = 0;
+        for (chunk, 0..) |byte, index| {
+            if (byte != '\n') continue;
+            widest = @max(widest, text_measure_cache.advanceSliceWidth(advances, line_start, index));
+            line_start = index + 1;
+        }
+        if (line_start < chunk.len) {
+            widest = @max(widest, text_measure_cache.advanceSliceWidth(advances, line_start, chunk.len));
+        }
+        chunk_start = chunk_end;
+    }
+    return widest;
+}
+
 fn widgetTextInputTrailingInset(widget: Widget, text_size: f32, inset: f32) f32 {
+    // A code editor's leading inset is its line-number gutter, not symmetric
+    // field padding. Its source viewport runs all the way to the trailing
+    // edge; mirroring the gutter here invents horizontal overflow for lines
+    // that visibly fit beside the numbers.
+    if (widget.code_editor) return 0;
     if (widget.kind == .combobox) return inset + @max(8, text_size - 4);
     // A search field holding text reserves the trailing slot for the
     // built-in clear affordance so the text never runs under the x.

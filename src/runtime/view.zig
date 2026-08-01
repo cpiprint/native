@@ -29,9 +29,7 @@ const max_canvas_visual_effects_per_view = canvas_limits.max_canvas_visual_effec
 const max_canvas_text_layouts_per_view = canvas_limits.max_canvas_text_layouts_per_view;
 const max_canvas_widget_nodes_per_view = canvas_limits.max_canvas_widget_nodes_per_view;
 const max_canvas_widget_semantics_per_view = canvas_limits.max_canvas_widget_semantics_per_view;
-const max_canvas_widget_text_bytes_per_view = canvas_limits.max_canvas_widget_text_bytes_per_view;
 const max_canvas_widget_source_text_entries_per_view = canvas_limits.max_canvas_widget_source_text_entries_per_view;
-const max_canvas_widget_text_history_bytes_per_view = canvas_limits.max_canvas_widget_text_history_bytes_per_view;
 const max_canvas_widget_text_history_entries_per_view = canvas_limits.max_canvas_widget_text_history_entries_per_view;
 
 const CanvasWidgetSourceTextEntry = canvas_widget_runtime.CanvasWidgetSourceTextEntry;
@@ -161,12 +159,10 @@ pub fn clearImeGraceOnViewBlur(runtime: anytype, view: *RuntimeView) void {
     // otherwise leave the carry armed to swallow the refocused view's
     // first unrelated commit.
     view.canvas_widget_claimed_key_grace = .none;
-    // A Tab that entered a live terminal suppresses its repeats and
-    // release until the physical key comes up. If the view blurs first,
-    // that release may never arrive here; retire the latch with the
-    // other view-local input graces so a later Tab is never mistaken
-    // for the tail of the old gesture.
-    view.canvas_widget_terminal_focus_entry_tab_held = false;
+    // A Tab that entered a Tab-owning editor (live terminal or editable
+    // code) suppresses its repeats and release until the physical key
+    // comes up. If the view blurs first, retire the latch here.
+    view.canvas_widget_tab_input_focus_entry_held = false;
     // Same physical-lifetime rule for terminal Paste: a native menu can
     // synthesize only the key-down, and a real Cmd/Ctrl+V may release its
     // modifier before V. Blur retires either incomplete gesture so no
@@ -538,12 +534,11 @@ pub const RuntimeView = struct {
     /// one is still held, on hosts that emit input-method text before
     /// its key_down) flows instead of being eaten by a stale latch.
     canvas_widget_claimed_key_grace: CanvasWidgetClaimedKeyGrace = .none,
-    /// A physical Tab whose first key-down moved focus INTO a live
-    /// terminal. Its auto-repeats and eventual release still belong to
-    /// focus traversal, not the newly focused pty; the gpu-input pass
-    /// suppresses those transitions and clears this on key-up (or view
-    /// blur through `clearImeGraceOnViewBlur`).
-    canvas_widget_terminal_focus_entry_tab_held: bool = false,
+    /// A physical Tab whose first key-down moved focus INTO a Tab-owning
+    /// editor (live terminal or editable code). Its auto-repeats and
+    /// eventual release still belong to focus traversal, not input for
+    /// the newly focused target.
+    canvas_widget_tab_input_focus_entry_held: bool = false,
     /// A Cmd/Ctrl+V key-down the clipboard pass converted into terminal
     /// paste input. Its physical V release belongs to that paste even if
     /// the modifier came up first; the raw gpu-input pass consumes it
@@ -706,6 +701,11 @@ pub const RuntimeView = struct {
     canvas_widget_click_count: u8 = 0,
     canvas_widget_click_timestamp_ns: u64 = 0,
     canvas_widget_click_point: geometry.PointF = .{},
+    /// A chain belongs to one physical pointer and one resolved press/text
+    /// target. Nearby controls must never donate the first click of another
+    /// control's double-click gesture.
+    canvas_widget_click_pointer_id: u64 = 0,
+    canvas_widget_click_target_id: canvas.ObjectId = 0,
     /// The anchor RUN of an in-flight multi-click drag: the word (or
     /// line) selected by the initiating double (triple) click. Drag
     /// extension unions the run under the pointer with this range, so
@@ -724,7 +724,11 @@ pub const RuntimeView = struct {
     canvas_widget_drag_regions: [canvas_limits.max_canvas_widget_window_drag_regions_per_view]platform.WindowDragRegion = undefined,
     canvas_widget_drag_region_count: usize = 0,
     canvas_widget_drag_regions_pushed: bool = false,
-    widget_text_bytes: [max_canvas_widget_text_bytes_per_view]u8 = undefined,
+    widget_text_inline_bytes: [canvas_limits.max_canvas_widget_inline_text_bytes_per_view]u8 = undefined,
+    /// Points at `widget_text_inline_bytes` for ordinary views and upgrades to
+    /// heap-owned large-file capacity only when a retained layout needs it.
+    widget_text_bytes: []u8 = &.{},
+    widget_text_bytes_heap_owned: bool = false,
     widget_text_len: usize = 0,
     widget_span_entries: [canvas_limits.max_canvas_widget_spans_per_view]canvas.TextSpan = undefined,
     widget_span_len: usize = 0,
@@ -763,7 +767,9 @@ pub const RuntimeView = struct {
     /// snapshot.
     canvas_widget_text_history_entries: [max_canvas_widget_text_history_entries_per_view]view_widget_text.CanvasWidgetTextHistoryEntry = undefined,
     canvas_widget_text_history_entry_count: usize = 0,
-    canvas_widget_text_history_bytes: [max_canvas_widget_text_history_bytes_per_view]u8 = undefined,
+    canvas_widget_text_history_inline_bytes: [canvas_limits.max_canvas_widget_inline_text_history_bytes_per_view]u8 = undefined,
+    canvas_widget_text_history_bytes: []u8 = &.{},
+    canvas_widget_text_history_bytes_heap_owned: bool = false,
     canvas_widget_text_history_byte_count: usize = 0,
     canvas_widget_text_history_next_serial: u64 = 1,
     /// Native textarea Up/Down retains its painted x coordinate while a
@@ -781,6 +787,7 @@ pub const RuntimeView = struct {
     const CanvasWidgetTextMethods = view_widget_text.RuntimeViewCanvasWidgetText(RuntimeView);
     pub const applyCanvasWidgetTextEdit = CanvasWidgetTextMethods.applyCanvasWidgetTextEdit;
     pub const applyCanvasWidgetTextEditWithoutHistory = CanvasWidgetTextMethods.applyCanvasWidgetTextEditWithoutHistory;
+    pub const canvasWidgetTextEditNeedsLargeStorage = CanvasWidgetTextMethods.canvasWidgetTextEditNeedsLargeStorage;
     pub const canvasWidgetKeyboardTextEdit = CanvasWidgetTextMethods.canvasWidgetKeyboardTextEdit;
     pub const canvasWidgetTextHistoryShortcut = CanvasWidgetTextMethods.canvasWidgetTextHistoryShortcut;
     pub const canvasWidgetTextHistoryAvailability = CanvasWidgetTextMethods.canvasWidgetTextHistoryAvailability;
@@ -1199,7 +1206,21 @@ pub const RuntimeView = struct {
     }
 
     pub fn copyRuntimeStateFrom(self: *RuntimeView, source: *const RuntimeView, scratch: *canvas_widget_runtime.CanvasWidgetCopyScratch) void {
+        const widget_text_bytes = self.widget_text_bytes;
+        const widget_text_bytes_heap_owned = self.widget_text_bytes_heap_owned;
+        const text_history_bytes = self.canvas_widget_text_history_bytes;
+        const text_history_bytes_heap_owned = self.canvas_widget_text_history_bytes_heap_owned;
         self.* = source.*;
+        self.widget_text_bytes = widget_text_bytes;
+        self.widget_text_bytes_heap_owned = widget_text_bytes_heap_owned;
+        self.canvas_widget_text_history_bytes = text_history_bytes;
+        self.canvas_widget_text_history_bytes_heap_owned = text_history_bytes_heap_owned;
+        if (self.canvas_widget_text_history_bytes.ptr != source.canvas_widget_text_history_bytes.ptr) {
+            @memcpy(
+                self.canvas_widget_text_history_bytes[0..source.canvas_widget_text_history_byte_count],
+                source.canvas_widget_text_history_bytes[0..source.canvas_widget_text_history_byte_count],
+            );
+        }
         self.label = copyInto(&self.label_storage, source.label) catch unreachable;
         self.parent = if (source.parent) |parent| copyInto(&self.parent_storage, parent) catch unreachable else null;
         self.role = copyInto(&self.role_storage, source.role) catch unreachable;
@@ -1212,5 +1233,22 @@ pub const RuntimeView = struct {
         self.copyWidgetLayoutTree(source.widgetLayoutTree(), scratch) catch unreachable;
         self.widget_revision = source.widget_revision;
         @memcpy(self.widget_scroll_states[0..source.widget_layout_node_count], source.widget_scroll_states[0..source.widget_layout_node_count]);
+    }
+
+    pub fn ensureLargeCanvasWidgetTextStorage(self: *RuntimeView, allocator: std.mem.Allocator) !void {
+        if (self.widget_text_bytes_heap_owned) return;
+        const text_bytes = try allocator.alloc(u8, canvas_limits.max_canvas_widget_text_bytes_per_view);
+        errdefer allocator.free(text_bytes);
+        const history_bytes = try allocator.alloc(u8, canvas_limits.max_canvas_widget_text_history_bytes_per_view);
+        errdefer allocator.free(history_bytes);
+        @memcpy(text_bytes[0..self.widget_text_len], self.widget_text_bytes[0..self.widget_text_len]);
+        @memcpy(
+            history_bytes[0..self.canvas_widget_text_history_byte_count],
+            self.canvas_widget_text_history_bytes[0..self.canvas_widget_text_history_byte_count],
+        );
+        self.widget_text_bytes = text_bytes;
+        self.widget_text_bytes_heap_owned = true;
+        self.canvas_widget_text_history_bytes = history_bytes;
+        self.canvas_widget_text_history_bytes_heap_owned = true;
     }
 };

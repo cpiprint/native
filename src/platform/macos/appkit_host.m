@@ -7352,6 +7352,30 @@ static BOOL NativeSdkScrollDriverCanConsumeHorizontally(NativeSdkScrollDriverVie
     }
     if (!restoreFrame) {
         [window center];
+        // AppKit centers every new window by default, which leaves a
+        // model-declared secondary window exactly covering the editor that
+        // opened it. Cascade from the active window like Win32's default
+        // placement so repeated Command+N windows stay visibly distinct.
+        NSWindow *referenceWindow = NSApp.keyWindow ?: self.window;
+        if (!makeMain && referenceWindow) {
+            NSRect referenceFrame = referenceWindow.frame;
+            NSRect cascadedFrame = window.frame;
+            cascadedFrame.origin.x = NSMinX(referenceFrame) + 24.0;
+            cascadedFrame.origin.y = NSMaxY(referenceFrame) - 24.0 - NSHeight(cascadedFrame);
+
+            // A maximized or edge-positioned reference must not push the new
+            // window beyond the usable screen. Fit the complete frame when
+            // possible; an oversized window keeps its leading/bottom edge.
+            NSScreen *referenceScreen = referenceWindow.screen ?: window.screen ?: NSScreen.mainScreen;
+            if (referenceScreen) {
+                NSRect visibleFrame = referenceScreen.visibleFrame;
+                CGFloat maxOriginX = MAX(NSMinX(visibleFrame), NSMaxX(visibleFrame) - NSWidth(cascadedFrame));
+                CGFloat maxOriginY = MAX(NSMinY(visibleFrame), NSMaxY(visibleFrame) - NSHeight(cascadedFrame));
+                cascadedFrame.origin.x = MIN(MAX(NSMinX(cascadedFrame), NSMinX(visibleFrame)), maxOriginX);
+                cascadedFrame.origin.y = MIN(MAX(NSMinY(cascadedFrame), NSMinY(visibleFrame)), maxOriginY);
+            }
+            [window setFrame:cascadedFrame display:NO];
+        }
     }
     if (makeMain) NativeSdkLaunchLap("window_chrome_ready");
 
@@ -12243,7 +12267,7 @@ native_sdk_appkit_open_dialog_result_t native_sdk_appkit_show_open_dialog(native
             NSString *path = [[NSString alloc] initWithBytes:opts->default_path length:opts->default_path_len encoding:NSUTF8StringEncoding];
             panel.directoryURL = [NSURL fileURLWithPath:path];
         }
-        panel.canChooseFiles = YES;
+        panel.canChooseFiles = opts->allow_directories == 0;
         panel.canChooseDirectories = opts->allow_directories != 0;
         panel.allowsMultipleSelection = opts->allow_multiple != 0;
         NativeSdkConfigurePanelExtensions(panel, NativeSdkParseExtensions(opts->extensions, opts->extensions_len));

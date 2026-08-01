@@ -161,6 +161,11 @@ pub const CanvasWidgetTextReconcileEntry = struct {
     text_selection: ?canvas.TextSelection = null,
     text_composition: ?canvas.TextRange = null,
     value: f32 = 0,
+    value_x: f32 = 0,
+    code_content_width: f32 = 0,
+    code_content_width_generation: u64 = 0,
+    code_content_width_font_id: u64 = 0,
+    code_content_width_size_bits: u32 = 0,
 };
 
 pub const CanvasWidgetSourceScrollEntry = struct {
@@ -245,6 +250,54 @@ pub fn restoreCanvasWidgetLayoutScrollOffsets(
         }
         if (restore.dx == 0 and restore.dy == 0) continue;
         translateCanvasWidgetLayoutScrollDescendants(nodes, index, .{ .dx = -restore.dx, .dy = -restore.dy });
+    }
+}
+
+fn previousLayoutHasSelectedTab(previous: canvas.WidgetLayoutTree, id: canvas.ObjectId) bool {
+    for (previous.nodes) |node| {
+        if (node.widget.id == id) return node.widget.semantics.role == .tab and node.widget.state.selected;
+    }
+    return false;
+}
+
+/// A tab activation reveals only the pixels outside its standing horizontal
+/// viewport. This runs after retained scroll restoration, against final layout
+/// frames, so an already-visible tab preserves the exact offset and a newly
+/// mounted native scroll driver never paints a speculative leading-edge jump.
+fn revealNewlySelectedTabs(previous: canvas.WidgetLayoutTree, nodes: []canvas.WidgetLayoutNode) void {
+    for (nodes, 0..) |tab_node, tab_index| {
+        const tab = tab_node.widget;
+        if (tab.semantics.role != .tab or !tab.state.selected) continue;
+        if (tab.id != 0 and previousLayoutHasSelectedTab(previous, tab.id)) continue;
+
+        var ancestor = tab_node.parent_index;
+        while (ancestor) |index| {
+            if (index >= nodes.len) break;
+            const scroll_node = nodes[index];
+            if (scroll_node.widget.kind == .scroll_view and
+                canvas.widgetScrollsAxis(scroll_node.widget, .horizontal) and
+                !scroll_node.widget.layout.virtualized)
+            {
+                const viewport = scroll_node.frame.inset(scroll_node.widget.layout.padding).normalized();
+                const tab_frame = nodes[tab_index].frame.normalized();
+                if (viewport.isEmpty() or tab_frame.isEmpty()) break;
+
+                const delta = if (tab_frame.x < viewport.x)
+                    tab_frame.x - viewport.x
+                else if (tab_frame.maxX() > viewport.maxX())
+                    tab_frame.maxX() - viewport.maxX()
+                else
+                    0;
+                if (delta == 0) break;
+                const current = scroll_node.widget.value_x;
+                const next = @max(0, current + delta);
+                if (next == current) break;
+                nodes[index].widget.value_x = next;
+                translateCanvasWidgetLayoutScrollDescendants(nodes, index, .{ .dx = -(next - current) });
+                break;
+            }
+            ancestor = scroll_node.parent_index;
+        }
     }
 }
 
@@ -612,6 +665,11 @@ pub fn collectCanvasWidgetTextReconcileEntries(
             .text_selection = node.widget.text_selection,
             .text_composition = node.widget.text_composition,
             .value = node.widget.value,
+            .value_x = node.widget.value_x,
+            .code_content_width = node.widget.code_content_width,
+            .code_content_width_generation = node.widget.code_content_width_generation,
+            .code_content_width_font_id = node.widget.code_content_width_font_id,
+            .code_content_width_size_bits = node.widget.code_content_width_size_bits,
         };
         len += 1;
     }
@@ -819,6 +877,13 @@ pub fn canvasWidgetLayoutNodeWithTextReconcileState(
         // right after, so a resized or re-texted field never keeps a
         // stale offset).
         if (canvasWidgetEditableTextKind(copy.widget.kind)) copy.widget.value = entry.value;
+        if (copy.widget.code_editor) {
+            copy.widget.value_x = entry.value_x;
+            copy.widget.code_content_width = entry.code_content_width;
+            copy.widget.code_content_width_generation = entry.code_content_width_generation;
+            copy.widget.code_content_width_font_id = entry.code_content_width_font_id;
+            copy.widget.code_content_width_size_bits = entry.code_content_width_size_bits;
+        }
         if (copy.widget.text_selection == null and copy.widget.text_composition == null) {
             copy.widget.text_selection = entry.text_selection;
             copy.widget.text_composition = entry.text_composition;
@@ -968,6 +1033,7 @@ pub fn canvasWidgetLayoutTreeWithRuntimeReconcileState(
     // the caller AFTER native scroll drivers are stamped — a rebuild
     // mid-rubber-band must not clamp an offset the OS scroller owns.
     restoreCanvasWidgetLayoutScrollOffsets(staged_nodes, previous_runtime_offsets, previous_source_scroll_entries);
+    revealNewlySelectedTabs(previous, staged_nodes);
 
     const index_scratch = canvas_widget_reconcile_index_scratch.get();
     index_scratch.controls.build(previous_control_states);
@@ -1102,7 +1168,12 @@ pub fn clampCanvasWidgetLayoutScrollOffsets(nodes: []canvas.WidgetLayoutNode, st
 pub fn clampCanvasWidgetLayoutTextOffsets(nodes: []canvas.WidgetLayoutNode, tokens: canvas.DesignTokens) void {
     for (nodes) |*node| {
         if (node.widget.kind == .textarea) {
+            canvas.cacheTextInputContentWidthForWidget(&node.widget, tokens);
             node.widget.value = canvas.clampedTextInputScrollOffsetForWidget(node.widget, tokens, node.widget.value);
+            node.widget.value_x = if (node.widget.code_editor)
+                canvas.clampedTextInputHorizontalScrollOffsetForWidget(node.widget, tokens, node.widget.value_x)
+            else
+                0;
             continue;
         }
         if (!canvasWidgetSingleLineTextKind(node.widget.kind)) continue;
@@ -1499,8 +1570,10 @@ fn canvasWidgetTreeRowFocusTarget(layout: canvas.WidgetLayoutTree, node_index: u
 /// the focused row is a leaf or collapsed (an expanded row collapses
 /// instead — no focus move, the routed toggle intent handles it); Right
 /// moves to the FIRST CHILD row when the focused row is expanded (a
-/// collapsed row expands instead). Null = no tree move (the caller
-/// falls through to group/spatial focus).
+/// collapsed row expands instead). Flat sibling rows may declare a
+/// one-based `tree_level`; otherwise parent/child relationships derive
+/// from widget nesting. Null = no tree move (the caller falls through to
+/// group/spatial focus).
 pub fn canvasWidgetTreeDirectionalFocusTarget(
     layout: canvas.WidgetLayoutTree,
     focused: canvas.WidgetFocusTarget,
@@ -1520,7 +1593,7 @@ pub fn canvasWidgetTreeDirectionalFocusTarget(
         .right => blk: {
             const expanded = layout.nodes[focused.index].widget.state.expanded orelse false;
             if (!expanded) break :blk null; // expand intent (or leaf no-op)
-            break :blk canvasWidgetTreeFirstChildRow(layout, focused.index) orelse focused;
+            break :blk canvasWidgetTreeFirstChildRow(layout, tree_index, focused.index) orelse focused;
         },
         .forward, .backward => null,
     };
@@ -1578,6 +1651,20 @@ fn canvasWidgetTreeAdjacentRow(
 }
 
 fn canvasWidgetTreeParentRow(layout: canvas.WidgetLayoutTree, tree_index: usize, focused_index: usize) ?canvas.WidgetFocusTarget {
+    const focused_level = layout.nodes[focused_index].widget.tree_level;
+    if (focused_level > 1) {
+        var index = focused_index;
+        while (index > tree_index + 1) {
+            index -= 1;
+            const widget = layout.nodes[index].widget;
+            if (widget.semantics.role != .treeitem) continue;
+            if (widget.tree_level == focused_level - 1) {
+                return canvasWidgetTreeRowFocusTarget(layout, index);
+            }
+            if (widget.tree_level != 0 and widget.tree_level < focused_level - 1) return null;
+        }
+        return null;
+    }
     var current = layout.nodes[focused_index].parent_index;
     while (current) |index| {
         if (index >= layout.nodes.len or index == tree_index) return null;
@@ -1587,7 +1674,21 @@ fn canvasWidgetTreeParentRow(layout: canvas.WidgetLayoutTree, tree_index: usize,
     return null;
 }
 
-fn canvasWidgetTreeFirstChildRow(layout: canvas.WidgetLayoutTree, focused_index: usize) ?canvas.WidgetFocusTarget {
+fn canvasWidgetTreeFirstChildRow(layout: canvas.WidgetLayoutTree, tree_index: usize, focused_index: usize) ?canvas.WidgetFocusTarget {
+    const focused_level = layout.nodes[focused_index].widget.tree_level;
+    if (focused_level > 0) {
+        const tree_depth = layout.nodes[tree_index].depth;
+        var index = focused_index + 1;
+        while (index < layout.nodes.len and layout.nodes[index].depth > tree_depth) : (index += 1) {
+            const widget = layout.nodes[index].widget;
+            if (widget.semantics.role != .treeitem) continue;
+            if (@as(u32, widget.tree_level) == @as(u32, focused_level) + 1) {
+                return canvasWidgetTreeRowFocusTarget(layout, index);
+            }
+            return null;
+        }
+        return null;
+    }
     const row_depth = layout.nodes[focused_index].depth;
     var index = focused_index + 1;
     while (index < layout.nodes.len and layout.nodes[index].depth > row_depth) : (index += 1) {
